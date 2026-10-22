@@ -86,6 +86,46 @@ API): write/read replacement is converged at the `cache.update(k, v,
 layer_idx)` interface — zero model surgery, works with any CausalLM
 (Llama/Qwen/Mistral-style GQA included).
 
+## Transformers integration (real-world tested on Qwen3.5-0.8B)
+
+Hybrid architectures (e.g. Qwen3.5: 18 linear-attention layers + 6
+full-attention layers) are handled automatically —
+`FlashCodecCache.from_config(model.config)` attaches codec layers **only to
+`full_attention` layers** and keeps native dynamic layers for everything
+else (recurrent/conv states untouched). `apply_flash_codec` uses `from_config`
+whenever a model config is available.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from flashcodec import apply_flash_codec
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B",
+                                             torch_dtype="bfloat16").cuda()
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+ids = tok("杭州的西湖", return_tensors="pt").input_ids.cuda()
+
+# One line — every generate() now runs on the codec cache
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2)
+out = model.generate(ids, max_new_tokens=48, do_sample=False)
+```
+
+Measured on Qwen3.5-0.8B (bf16, CUDA, 48 greedy tokens, `benchmarks/run_qwen_demo.py`):
+
+| Tier | Storage vs raw KV | Output | Verdict |
+|---|---|---|---|
+| `png keep=1.0` | ~1.9× (fp32 deltas for exactness) | **bit-identical tokens to the unpatched model** | 100% fidelity baseline |
+| `jpeg k=2` | **27.6%** (~4×) | fluent, 28.8% token match | lossy tier |
+| `jpeg k=4` | 51.7% (~2×) | fluent, 35.6% token match | lossy tier |
+
+Hybrid-layer audit: `codec_layers=6/24` (full attention only), zero warnings.
+Reproduce with `python benchmarks/run_qwen_demo.py` (offline; honors
+`FLASHCODEC_MODEL` / `FLASHCODEC_NEW_TOKENS`).
+
+dtype contracts (see `AGENTS.md`): PNG deltas are always fp32 (bf16
+differences lose the bitwise-exactness the lossless tier promises); JPEG
+coefficients and `read()` views stay in the stream's input dtype (SDPA
+requires q/k/v dtype parity).
+
 ## Benchmarks (measured; B=2 H=8 S=2048 D=64, random-walk autocorrelated signal, fp32)
 
 ### Reconstruction quality (`benchmarks/bench_reconstruct.py`)

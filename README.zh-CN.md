@@ -80,6 +80,43 @@ k, v = cache.decode_step(new_k, new_v)      # 增量解码
 KV 写入与读取的替换收敛在 `cache.update(k, v, layer_idx)` 接口——零模型
 手术，任意 CausalLM（含 Llama/Qwen/Mistral 风格 GQA）通用。
 
+## Transformers 集成（Qwen3.5-0.8B 实战验证）
+
+混合架构（如 Qwen3.5：18 层线性注意力 + 6 层全注意力）自动处理——
+`FlashCodecCache.from_config(model.config)` **只给 `full_attention` 层挂
+codec 层**，其余层类型保留原生动态层（递归/卷积状态不受影响）。
+`apply_flash_codec` 在拿到模型 config 时自动走 `from_config`。
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from flashcodec import apply_flash_codec
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B",
+                                             torch_dtype="bfloat16").cuda()
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+ids = tok("杭州的西湖", return_tensors="pt").input_ids.cuda()
+
+# 一行搞定——之后每次 generate() 都走编解码缓存
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2)
+out = model.generate(ids, max_new_tokens=48, do_sample=False)
+```
+
+Qwen3.5-0.8B 实测（bf16、CUDA、48 个贪心 token，`benchmarks/run_qwen_demo.py`）：
+
+| 档位 | 存储 vs raw KV | 输出 | 结论 |
+|---|---|---|---|
+| `png keep=1.0` | ~1.9×（fp32 差分换精确）| **生成 token 与未打补丁模型逐位一致** | 100% 保真基线 |
+| `jpeg k=2` | **27.6%**（约 4×）| 文本流畅，token 一致率 28.8% | 有损档 |
+| `jpeg k=4` | 51.7%（约 2×）| 文本流畅，token 一致率 35.6% | 有损档 |
+
+混合层审计：`codec_layers=6/24`（仅全注意力层），零警告。复跑：
+`python benchmarks/run_qwen_demo.py`（离线加载；支持 `FLASHCODEC_MODEL` /
+`FLASHCODEC_NEW_TOKENS` 环境变量）。
+
+dtype 契约（详见 `AGENTS.md`）：PNG 差分恒为 fp32（bf16 差分会破坏无损
+档承诺的逐位精确性）；JPEG 系数与 `read()` 视图保持流输入 dtype
+（SDPA 要求 q/k/v 同 dtype）。
+
 ## 基准（实测，B=2 H=8 S=2048 D=64，随机游走自相关信号，fp32）
 
 ### 重构质量（`benchmarks/bench_reconstruct.py`）
