@@ -27,16 +27,16 @@
 ```
                     ┌────────────────────────────────────────────┐
   (B,H,S,D) ──append──▶  raw_buffer（未满 r 的尾部，原始高保真）  │
-                    │        │ 满 r 个 token，批量归档（一次 GEMM， │
+                    │        │ 满 r 个 token，批量归档（一次 GEMM │
                     │        ▼  原地切片写入）                    │
-                    │  compressed_storage（倍增预分配）            │
+                    │  compressed_storage（倍增预分配）           │
                     │   jpeg: 系数 (B,H,capacity,K,D)             │
                     │   png:  deltas (B,H,capacity,r-1,D)         │
                     │        + anchors (B,H,capacity,D)           │
                     └───────────────┬────────────────────────────┘
-                                    │ read()：有效区单次解码 + raw 尾
+                                    │ read()：有效区解码 + raw 尾
                                     ▼
-                        重构 KV 视图 (B,H,S,D)
+                            重构 KV 视图 (B,H,S,D)
 ```
 
 归档存放在**单块几何倍增缓冲区**里（std::vector 式：初始 16 块，装满翻倍）。
@@ -134,7 +134,6 @@ png 无损 / jpeg k=1,2,4），底部柱状图对比存储与耗时的节约，�
 ```bash
 pip install gradio matplotlib
 python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
-python demo/qwen_webchat.py        # 零依赖 stdlib SSE webchat
 ```
 
 ## 基准（实测，B=2 H=8 S=2048 D=64，随机游走自相关信号，fp32）
@@ -173,7 +172,7 @@ flashcodec/
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
 ├── tests/                 # jpeg / png / causal 三组测试（直接运行或 pytest）
 ├── benchmarks/            # 显存压测 + PSNR/余弦质量压测
-├── demo/                  # Gradio 左右对比 chat + 零依赖 stdlib webchat
+├── demo/                  # Gradio 左右对比 chat
 ├── images/                # README 截图
 ├── pyproject.toml
 └── README.md

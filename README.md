@@ -146,7 +146,6 @@ storage & latency savings and a token-match table underneath.
 ```bash
 pip install gradio matplotlib
 python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
-python demo/qwen_webchat.py        # zero-dependency stdlib SSE webchat
 ```
 
 ## Benchmarks (measured; B=2 H=8 S=2048 D=64, random-walk autocorrelated signal, fp32)
@@ -186,7 +185,7 @@ flashcodec/
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
 ├── tests/                 # jpeg / png / causal suites (standalone scripts or pytest)
 ├── benchmarks/            # storage benchmark + PSNR/cosine quality benchmark
-├── demo/                  # Gradio side-by-side chat + zero-dependency webchat
+├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
 ├── pyproject.toml
 └── README.md
