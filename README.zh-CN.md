@@ -87,6 +87,10 @@ out = model.generate(input_ids, max_new_tokens=64)
 from flashcodec import remove_flash_codec
 remove_flash_codec(model)          # 随时还原默认行为
 
+# 免物化解码（系数域 attention，不构建 KV 视图）：
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2,
+                  quant_bits=8, materialization_free=True)
+
 # 3) 独立使用（无需 transformers）：直接操作缓存管理器
 from flashcodec import CodecKVCache
 cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
@@ -162,6 +166,24 @@ k<r、jpeg int8、png，含 GQA 分组）。`(S, D)` 的重构视图从不出现
 适用范围：**仅解码**（prefill 仍走物化视图——系数形式会让 score 张量爆炸），
 且目前是参考 kernel，尚未接进 HF 各 attention 模块。png 每块存 r 行，数值上
 支持但省不了内存；收益来自 jpeg `k < r`（以及 int8，剩余峰值主要是反量化）。
+
+`apply_flash_codec(model, ..., materialization_free=True)` 已把它接进
+transformers：包装标准 Llama/Qwen 风格 attention 模块的 forward（投影 + RoPE
+不变，只替换 attention 输出），带单 token / batch=1 / eval / 非滑窗的守卫，
+不满足条件自动回退原路径；prefill 的重构视图在第一个 decode step 释放。
+`remove_flash_codec` 完整还原。
+
+端到端（`benchmarks/bench_e2e.py`，Qwen3-0.6B，4096 token prompt + 32 token）：
+
+| 档位 | tok/s | peak | steady |
+|---|---|---|---|
+| baseline（原始 KV） | 53.2 | 581MB | 0MB |
+| codec k=2 int8（物化） | 44.9 | 1545MB | 1535MB |
+| codec k=2 int8（免物化） | 30.7 | **642MB** | **122MB** |
+
+权衡很明确：**稳态显存降到 1/12.6**（峰值回到 baseline 水平），代价是解码慢
+约 1.7×——系数域是一串小 matmul，不是融合 attention kernel。下一步就是把它写成
+Triton kernel。
 
 ## Demo（Qwen3.5-0.8B 左右对比 Chat）
 

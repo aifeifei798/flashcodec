@@ -98,6 +98,10 @@ out = model.generate(input_ids, max_new_tokens=64)
 from flashcodec import remove_flash_codec
 remove_flash_codec(model)          # restore default behavior
 
+# Materialization-free decode (coefficient-domain attention, no KV view):
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2,
+                  quant_bits=8, materialization_free=True)
+
 # 3) Standalone (no transformers needed): direct cache manager
 from flashcodec import CodecKVCache
 cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
@@ -181,6 +185,25 @@ explode the score tensor), and it is a reference kernel, not yet wired into HF
 attention modules. png stores r rows per block, so it is numerically supported
 but gains nothing; the win is jpeg `k < r` (and int8, whose dequantization is
 the remaining peak).
+
+`apply_flash_codec(model, ..., materialization_free=True)` wires it into
+transformers: the forward of standard Llama/Qwen-style attention modules is
+wrapped (projection + RoPE unchanged, the attention output replaced), guarded to
+single-token / batch-1 / eval / non-sliding layers, otherwise it falls back to
+the original path. The prefill reconstruction is released on the first decode
+step. `remove_flash_codec` restores everything.
+
+End-to-end (`benchmarks/bench_e2e.py`, Qwen3-0.6B, 4096-token prompt + 32 new):
+
+| tier | tok/s | peak | steady |
+|---|---|---|---|
+| baseline (raw KV) | 53.2 | 581MB | 0MB |
+| codec k=2 int8, materialized | 44.9 | 1545MB | 1535MB |
+| codec k=2 int8, materialization-free | 30.7 | **642MB** | **122MB** |
+
+The trade-off is explicit: **12.6× less steady memory** (peak back to baseline)
+for ~1.7× slower decode — the coefficient path is a sequence of small matmuls,
+not a fused attention kernel. That is the next thing to fix (a Triton kernel).
 
 ## Demo (side-by-side chat on Qwen3.5-0.8B)
 

@@ -43,17 +43,19 @@ def block_basis(codec, block_size, device=None, dtype=torch.float32):
     return tri
 
 
-def _stored_rows(stream):
-    """Stored rows of the archived blocks, in fp32: (B, H, n, s, D)."""
+def _stored_rows(stream, dtype=torch.float32):
+    """Stored rows of the archived blocks: (B, H, n, s, D). jpeg-int8 is
+    dequantized straight into ``dtype`` (bf16 on half-precision models: halves
+    the traffic and uses the tensor cores); png stays fp32 because its lossless
+    promise forbids down-casting the deltas."""
     n = stream.n_blocks
     if n == 0:
         return None
     codec = stream.codec
     if codec.name == "jpeg":
-        rows = stream._coeffs[:, :, :n].float()
+        rows = stream._coeffs[:, :, :n]
         if codec.quantized:
-            rows = dequantize_coeffs(stream._coeffs[:, :, :n],
-                                     stream._scales[:, :, :n])
+            return dequantize_coeffs(rows, stream._scales[:, :, :n], dtype)
         return rows
     # png: anchor + deltas are already the stored rows; stack them on the row axis
     return torch.cat([stream._anchors[:, :, :n].unsqueeze(-2).float(),
@@ -84,33 +86,34 @@ def codec_decode_attention(query, key_stream, value_stream, scale=None):
                          "materialized view")
     scale = D ** -0.5 if scale is None else scale
 
-    krows = _stored_rows(key_stream)
-    vrows = _stored_rows(value_stream)
+    krows = _stored_rows(key_stream, query.dtype)
+    vrows = _stored_rows(value_stream, query.dtype)
     if krows is None and key_stream.raw is None:          # empty cache
         return torch.zeros_like(query)
     Hk = krows.shape[1] if krows is not None else key_stream.raw.shape[1]
     assert Hq % Hk == 0, \
         f"query heads ({Hq}) must be a multiple of kv heads ({Hk})"
     G = Hq // Hk
-    qg = query.float().reshape(B, Hk, G, 1, D)
+    wd = krows.dtype if krows is not None else torch.float32
+    qg = query.to(wd).reshape(B, Hk, G, 1, D)
 
-    logits, out = [], torch.zeros(B, Hk, G, D, dtype=torch.float32,
-                                  device=qg.device)
+    logits, out = [], torch.zeros(B, Hk, G, D, dtype=wd, device=qg.device)
 
     if krows is not None:
         A = block_basis(key_stream.codec, key_stream.block_size,
-                        device=qg.device)
+                        device=qg.device, dtype=wd)
         s = torch.einsum("bhgqd,bhnsd->bhgns", qg, krows)   # (B,Hk,G,n,s)
         logits.append(torch.einsum("bhgns,rs->bhgnr", s, A).flatten(-2))
 
     if key_stream.raw is not None:                       # raw tail (full fidelity)
         logits.append(torch.einsum("bhgqd,bhtd->bhgt", qg,
-                                   key_stream.raw.float()))
+                                   key_stream.raw.to(wd)))
 
     if not logits:                                       # empty cache
         return torch.zeros_like(query)
 
-    probs = torch.softmax(torch.cat(logits, dim=-1) * scale, dim=-1)
+    probs = torch.softmax(torch.cat(logits, dim=-1).float() * scale,
+                          dim=-1).to(wd)
     pos = 0
     if krows is not None:
         n, r = krows.shape[2], key_stream.block_size
@@ -121,5 +124,5 @@ def codec_decode_attention(query, key_stream, value_stream, scale=None):
     if key_stream.raw is not None:
         p_raw = probs[..., pos:]
         out = out + torch.einsum("bhgt,bhtd->bhgd", p_raw,
-                                 value_stream.raw.float())
+                                 value_stream.raw.to(wd))
     return out.reshape(B, Hq, 1, D).to(query.dtype)

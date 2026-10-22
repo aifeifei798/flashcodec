@@ -139,8 +139,19 @@ Read this whole file before making changes.
   numerically supported but stores r rows per block, so it saves nothing — the
   win is jpeg `k < r`. Remaining peak is the int8→fp32 dequantization of rows.
 - Measured (B=1 H_kv=8 H_q=16 D=64 fp32, 64K): materialized 0.86ms/520MB →
-  coefficient 0.46ms/128MB. Not wired into HF attention modules yet; it is a
-  reference kernel covered by `tests/test_attention.py`.
+  coefficient 0.46ms/128MB.
+- **HF integration**: `apply_flash_codec(..., materialization_free=True)` wraps
+  standard Llama/Qwen-style attention forwards (`patch_attention.py`); guards are
+  batch=1 / single-token / eval / no sliding window / standard
+  `position_embeddings`, otherwise it falls back silently. Prefill still
+  materializes; the first decode step drops the view (`discard_view()` +
+  `layer.keys = None`, otherwise the prefill view stays referenced and no memory
+  is saved).
+- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): baseline 53.2 tok/s /
+  peak 581MB; codec k=2 int8 materialized 44.9 tok/s / steady 1535MB; with
+  materialization-free 30.7 tok/s / peak 642MB / steady 122MB. **Memory 12.6×
+  better, decode ~1.7× slower** — it is a sequence of small matmuls, not a fused
+  kernel; a Triton kernel is the open optimization.
 - `per_layer={idx: {keep_freqs/quant_bits/...}}` on `from_config` applies a
   calibrated schedule. Measured Qwen3-0.6B: adaptive (cheapest 14 layers at k=4)
   40.83 ppl at 75% storage vs uniform k=6 48.05 at 75% and uniform k=r int8

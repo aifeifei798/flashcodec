@@ -60,7 +60,8 @@ def _make_factory(mode, block_size, kwargs, sink, config=None):
     return factory
 
 
-def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
+def apply_flash_codec(model, mode="jpeg", block_size=8,
+                      materialization_free=False, **kwargs):
     """One-line hot patch: inject a codec KV cache into model (native
     transformers 5.x).
 
@@ -68,7 +69,10 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
     or 8 for int8 coefficients) and mode="png" (kwargs: keep_ratio, default
     1.0).
     Afterwards every `model.generate(..., use_cache=True)` call that does not
-    pass past_key_values explicitly uses FlashCodecCache. Returns model;
+    pass past_key_values explicitly uses FlashCodecCache. With
+    ``materialization_free=True`` the forward of standard Llama/Qwen-style
+    attention modules is patched too, so decode steps attend on the stored rows
+    directly (no reconstructed KV view). Returns model;
     `remove_flash_codec(model)` restores it at any time."""
     if getattr(model, "_flashcodec", None) is not None:
         warnings.warn("model is already patched with flashcodec, "
@@ -98,8 +102,13 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
 
     model.generate = wrapped_generate
     model.forward = wrapped_forward
+    n_wrapped = 0
+    if materialization_free:
+        from .patch_attention import apply_codec_attention
+        n_wrapped = apply_codec_attention(model)
     model._flashcodec = {
         "mode": mode, "caches": caches, "attention_modules": attns,
+        "codec_attention_modules": n_wrapped,
         "undo": lambda: _restore(model, base_generate, base_forward)}
     if not attns:
         warnings.warn("no attention module with k_proj/v_proj found — if the "
@@ -109,6 +118,8 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
 
 
 def _restore(model, base_generate, base_forward):
+    from .patch_attention import remove_codec_attention
+    remove_codec_attention(model)
     model.generate = base_generate
     model.forward = base_forward
     model._flashcodec = None

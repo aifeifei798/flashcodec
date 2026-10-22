@@ -8,6 +8,25 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [0.5.0] — 2026-10-23
+
+### Added
+
+- **HF integration for materialization-free decode**:
+  `apply_flash_codec(..., materialization_free=True)` wraps standard
+  Llama/Qwen-style attention forwards so decode steps attend on the stored rows
+  (projection + RoPE unchanged, guarded to batch-1 / single-token / eval /
+  non-sliding layers, silent fallback otherwise). The prefill view is dropped on
+  the first decode step. `remove_flash_codec` restores everything;
+  `codec_attention_stats(model)` reports the wrapped module count.
+- `benchmarks/bench_e2e.py`: long-context end-to-end benchmark (speed, peak and
+  steady memory). Qwen3-0.6B, 4096-token prompt + 32 new tokens:
+  baseline 53.2 tok/s / peak 581MB; codec k=2 int8 materialized 44.9 tok/s /
+  steady 1535MB; materialization-free 30.7 tok/s / peak 642MB / steady 122MB
+  (12.6× less steady memory, ~1.7× slower decode).
+- `tests/test_hf_integration.py` covers the patched generate path (lossless tier
+  still token-identical, no reconstruction view retained, clean removal).
+
 ## [0.4.0] — 2026-10-23
 
 ### Added

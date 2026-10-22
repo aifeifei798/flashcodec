@@ -192,6 +192,14 @@ class _CodecStream:
         self._rec[:, :, a * r:b * r].copy_(rec)
         self._rec_blocks = b
 
+    def discard_view(self):
+        """Drop the memoized reconstruction buffer (it is rebuilt on demand by
+        `read()`). Used by the materialization-free decode path: once prefill is
+        over the view is dead weight, and decode attends on the stored rows."""
+        self._rec = None
+        self._rec_blocks = 0
+        self._rec_capacity = 0
+
     def read(self):
         """Reconstructed view (B,H,S,D): one decode of the newly archived
         blocks (memoized, append-only) + concatenation of the raw tail.

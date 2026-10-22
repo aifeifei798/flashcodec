@@ -100,9 +100,9 @@ def quantize_coeffs(coeffs, bits=8):
     return q, scale.to(torch.float32)
 
 
-def dequantize_coeffs(q, scale):
-    """int8 coefficients + per-row scale -> fp32 coefficients."""
-    return q.float() * scale
+def dequantize_coeffs(q, scale, dtype=torch.float32):
+    """int8 coefficients + per-row scale -> coefficients in ``dtype``."""
+    return q.to(dtype) * scale.to(dtype)
 
 
 class JPEGCodec:

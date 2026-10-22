@@ -18,12 +18,15 @@ from .codecs import JPEGCodec, PNGCodec, dct_basis, dct_compress, \
     quantize_coeffs
 from .patch import apply_flash_codec, find_attention_modules, \
     remove_flash_codec, undo_flash_codec
+from .patch_attention import apply_codec_attention, codec_attention_stats, \
+    remove_codec_attention
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",
     "find_attention_modules",
+    "apply_codec_attention", "remove_codec_attention", "codec_attention_stats",
     "CodecKVCache", "FlashCodecCache", "FlashCodecLayer", "make_codec",
     "HAS_HF_CACHE", "JPEGCodec", "PNGCodec",
     "codec_decode_attention", "block_basis",

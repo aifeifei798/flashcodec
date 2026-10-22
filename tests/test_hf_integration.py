@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from flashcodec import (FlashCodecCache, apply_flash_codec,
+from flashcodec import (FlashCodecCache, apply_flash_codec, codec_attention_stats,
                         find_attention_modules, remove_flash_codec)
 
 torch.manual_seed(0)
@@ -206,6 +206,32 @@ def test_h_per_layer_schedule():
     out = gen(model, past_key_values=cache)
     assert out.shape == (1, PROMPT_LEN + NEW)
     assert cache.get_seq_length() == PROMPT_LEN + NEW - 1
+
+
+def test_i_materialization_free_generate():
+    """The coefficient-domain attention patch produces the same tokens on the
+    lossless tier, wraps every attention module, drops the prefill view, and is
+    fully removable."""
+    base = build_tiny_llama()
+    ref = gen(base)
+    model = build_tiny_llama()
+    apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0,
+                      materialization_free=True)
+    n_layers = model.config.num_hidden_layers
+    assert model._flashcodec["codec_attention_modules"] == n_layers
+    assert codec_attention_stats(model) == n_layers
+    out = gen(model)
+    assert torch.equal(ref, out), "materialization-free lossless run diverged"
+
+    cache = model._flashcodec["caches"][-1]
+    assert cache.get_seq_length() == PROMPT_LEN + NEW - 1
+    for layer in cache.layers:
+        assert layer._key_stream._rec is None, \
+            "decode must not keep the reconstructed view"
+
+    remove_flash_codec(model)
+    assert codec_attention_stats(model) == 0
+    assert gen(model).shape == ref.shape
 
 
 if __name__ == "__main__":
