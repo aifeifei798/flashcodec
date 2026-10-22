@@ -21,7 +21,7 @@ classifiers = [
 dependencies = ["torch>=2.0"]
 
 [project.urls]
-Homepage = "https://github.com/aifeifei798/Mini-Architecture"
+Homepage = "https://github.com/aifeifei798/flashcodec"
 
 [tool.setuptools.packages.find]
 include = ["flashcodec*"]
