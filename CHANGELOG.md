@@ -27,7 +27,10 @@ placeholder package).
 ### Changed
 
 - Distribution renamed to `flashcodec-kv` (import name unchanged) because the
-  `flashcodec` name on PyPI is taken by an unrelated placeholder package.
+  `flashcodec` name on PyPI is taken by an unrelated placeholder package. The
+  GitHub repository moved to
+  [aifeifei798/flashcodec-kv](https://github.com/aifeifei798/flashcodec-kv)
+  (the old URL redirects).
 - Four new regression tests: memoized read vs one-shot decode, exact and
   repeatable crop, beam-search batch gather, and beam search / crop parity
   against the unpatched model.

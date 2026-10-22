@@ -25,10 +25,10 @@ hf = ["transformers>=5.20"]
 demo = ["gradio", "matplotlib"]
 
 [project.urls]
-Homepage = "https://github.com/aifeifei798/flashcodec"
-Repository = "https://github.com/aifeifei798/flashcodec"
-Issues = "https://github.com/aifeifei798/flashcodec/issues"
-Changelog = "https://github.com/aifeifei798/flashcodec/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/aifeifei798/flashcodec-kv"
+Repository = "https://github.com/aifeifei798/flashcodec-kv"
+Issues = "https://github.com/aifeifei798/flashcodec-kv/issues"
+Changelog = "https://github.com/aifeifei798/flashcodec-kv/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["flashcodec*"]

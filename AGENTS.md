@@ -139,9 +139,11 @@ Read this whole file before making changes.
   `pyproject.toml`, `flashcodec/__init__.py::__version__` **and the top
   `CHANGELOG.md` entry**, so changing one requires syncing all three
   (`uv lock` afterwards: the lock records the project's own name/version).
-- **Distribution name is `flashcodec-kv`, import name is `flashcodec`** — the bare
-  `flashcodec` name on PyPI is an unrelated 0.0.0 placeholder package, never
-  publish under it (rename only if the user confirms they own that name).
+- **Distribution name is `flashcodec-kv`, import name is `flashcodec`**; the GitHub
+  repo is `aifeifei798/flashcodec-kv` (renamed from `flashcodec`; old URLs
+  redirect). The bare `flashcodec` name on PyPI is an unrelated 0.0.0 placeholder
+  package, never publish under it (rename only if the user confirms they own that
+  name).
 - `.github/workflows/ci.yml` runs the three codec tests plus the transformers
   integration test on CPU (Python 3.10 / 3.12, `pip install -e ".[hf]"`).
   `requires-python = ">=3.10"` is driven by transformers 5.20; don't lower it
