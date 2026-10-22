@@ -1,0 +1,58 @@
+# AGENTS.md — flashcodec
+
+独立开源项目：把 Transformer 时序 KV Cache 张量当"高维多媒体图像信号"压缩
+（jpeg=频域 DCT 有损 / png=时域差分无损）。纯 torch，无 pytest 依赖，
+无 CI。改动前先读完本文件。
+
+## 运行约定
+
+- **必须从本目录（`flashcodec/`）内运行**：包与项目目录同名，从父目录
+  `import flashcodec` 只会命中命名空间包（没有 `__version__`/导出）——这是
+  同名布局的固有陷阱。`pip install -e .` 后任意位置可导入。
+- 测试是直跑脚本（`assert` + `__main__` 汇总，函数名兼容 pytest）：
+  `python tests/test_jpeg.py`、`python tests/test_png.py`、
+  `python tests/test_causal.py`。改 codecs/cache 后三组全跑。
+- 基准：`python benchmarks/bench_reconstruct.py`（PSNR/余弦）、
+  `python benchmarks/bench_vram.py [--cuda]`（存储占用/耗时）。
+- 本目录在宿主仓库里被 gitignore——独立 git 仓库，独立发版。
+
+## 张量契约（改动任何签名前必读）
+
+- KV 布局 `(B, H, S, D)`；**压缩/滤波操作轴恒为 dim=-2（seq 轴）**。
+- codecs 内只允许批量矩阵乘/逐元素算子，**禁止显式 Python for 循环**；
+  尾部不足块用零填充（`_pad_to_blocks`），`out_len` 裁回。
+- codecs 统一 fp32 计算（`dct_compress` 等内部 `.float()`）；keep=r 的
+  DCT 与 keep_ratio=1 的 PNG 是"无损"基线（fp 往返 ~1e-6/1e-7 级，
+  断言容差见测试，别收紧到逐位）。
+
+## 因果安全不变量（破坏即 bug）
+
+1. **只归档完整块**；未满块永远留 `raw_buffer`（原始精度）——增量解码
+   任意时刻的未来扰动不得改写已归档张量（`test_causal` 逐位验证）。
+2. 全量 `forward(seq)` 与逐步 `decode_step` 两条填充路径产生的归档与
+   视图必须**逐位一致**（归档按块分片，解压逐片进行；不要改成"大 chunk
+   一次解压 vs 逐块解压"的不对称实现）。
+3. `mode="png", keep_ratio=1.0` 无损档位下，逐步解码注意力必须与全量
+   前向对齐 ≤1e-4（测试的正确性锚点）。
+
+## 设计决策（别"顺手重构"掉）
+
+- **HF 热补丁在 Cache 层而非注意力内核**：标准 HF 模型的 KV 写入/读取
+  统一收敛在 Cache 接口（`update`/`key_cache`），`CodecKVCache` 鸭子类型
+  注入即可，比逐模型手术（GQA/MQA/RoPE 变体）鲁棒得多。
+- **PNG 稠密存储如实计 1.0**：锚点+差分与原始块等大；省的是信息熵
+ （方差压缩 ~30×），压缩空间留给熵编码器——`storage_ratio()` 不许"四舍
+  五入"成 (r-1)/r。
+- 全量 `forward(seq)` 预填会把完整块直接压缩，块内位置注意力看到块级
+  重构（块内近似）；增量路径无此问题。这是已文档化的语义，不是 bug。
+- 归档数据结构：jpeg 存 coeffs `(B,H,n,k,D)` 单张量；png 存
+  `(deltas, anchor)` 元组——`cache.py` 与测试里都有 isinstance 分支，
+  新增模式时保持该约定。
+
+## 发版
+
+- `pyproject.toml`（setuptools，MIT，torch>=2.0），版本号在
+  `pyproject.toml` 与 `flashcodec/__init__.py::__version__` 双写，改一处
+  必须同步另一处。
+- 发 PyPI 前必跑三组测试 + 两个基准（README 里的实测表要随之更新——
+  README 的数字都是真实跑出来的，不许留占位或过期数据）。
