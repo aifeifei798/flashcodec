@@ -63,8 +63,12 @@ decoded attention matches full-sequence attention within ≤1e-4.
 ## Installation
 
 ```bash
-pip install -e .        # dependency: torch>=2.0
+pip install -e ".[hf]"  # from source: torch>=2.0 (+ transformers>=5.20 for the HF backend)
 ```
+
+Distribution name on PyPI: `flashcodec-kv` — the import name stays
+`flashcodec`. (The bare `flashcodec` name there belongs to an unrelated
+placeholder package, so don't `pip install flashcodec`.)
 
 ## Quick start
 
@@ -146,7 +150,7 @@ right (mode switchable: png lossless / jpeg k=1,2,4), with a bar chart of
 storage & latency savings and a token-match table underneath.
 
 ```bash
-pip install gradio matplotlib
+pip install -e ".[demo]"   # gradio + matplotlib
 python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
 ```
 
@@ -194,6 +198,8 @@ flashcodec/
 ├── benchmarks/            # storage benchmark + PSNR/cosine quality benchmark
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
+├── .github/workflows/     # CI: CPU tests + transformers integration
+├── CHANGELOG.md
 ├── pyproject.toml
 └── README.md
 ```

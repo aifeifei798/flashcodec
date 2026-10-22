@@ -17,7 +17,7 @@ from .codecs import JPEGCodec, PNGCodec, dct_basis, dct_compress, \
 from .patch import apply_flash_codec, find_attention_modules, \
     remove_flash_codec, undo_flash_codec
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",

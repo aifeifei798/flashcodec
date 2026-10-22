@@ -54,8 +54,11 @@ keep_ratio=1.0` 的无损档位下，逐步解码注意力与全量前向注意�
 ## 安装
 
 ```bash
-pip install -e .        # 依赖：torch>=2.0
+pip install -e ".[hf]"  # 源码安装：torch>=2.0（HF 后端另需 transformers>=5.20）
 ```
+
+PyPI 分发包名：`flashcodec-kv`，导入名仍是 `flashcodec`（PyPI 上的
+`flashcodec` 是无关占位包，别装错）。
 
 ## 快速上手
 
@@ -133,7 +136,7 @@ png 无损 / jpeg k=1,2,4），底部柱状图对比存储与耗时的节约，�
 一致率表。
 
 ```bash
-pip install gradio matplotlib
+pip install -e ".[demo]"   # gradio + matplotlib
 python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
 ```
 
@@ -179,6 +182,8 @@ flashcodec/
 ├── benchmarks/            # 显存压测 + PSNR/余弦质量压测
 ├── demo/                  # Gradio 左右对比 chat
 ├── images/                # README 截图
+├── .github/workflows/     # CI：CPU 测试 + transformers 集成
+├── CHANGELOG.md
 ├── pyproject.toml
 └── README.md
 ```

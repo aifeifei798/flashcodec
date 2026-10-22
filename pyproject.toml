@@ -3,11 +3,11 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flashcodec"
-version = "0.1.0"
+name = "flashcodec-kv"
+version = "0.2.0"
 description = "Compress Transformer time-series KV cache tensors as high-dimensional multimedia image signals: JPEG-style lossy frequency domain (DCT) plus PNG-style lossless time-domain deltas"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "feifei", email = "aifeifei798@gmail.com" }]
 keywords = ["kv-cache", "transformer", "dct", "compression", "llm", "inference"]
@@ -20,8 +20,15 @@ classifiers = [
 ]
 dependencies = ["torch>=2.0"]
 
+[project.optional-dependencies]
+hf = ["transformers>=5.20"]
+demo = ["gradio", "matplotlib"]
+
 [project.urls]
 Homepage = "https://github.com/aifeifei798/flashcodec"
+Repository = "https://github.com/aifeifei798/flashcodec"
+Issues = "https://github.com/aifeifei798/flashcodec/issues"
+Changelog = "https://github.com/aifeifei798/flashcodec/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 include = ["flashcodec*"]

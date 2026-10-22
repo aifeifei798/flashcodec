@@ -121,7 +121,8 @@ Read this whole file before making changes.
   (std::vector style, starting at 16 blocks, doubling when full) — jpeg uses
   `_coeffs (B,H,capacity,k,D)`; png uses `_deltas (B,H,capacity,r-1,D) fp32 +
   _anchors (B,H,capacity,D)`. Each full block only does an in-place slice write;
-  `read()` single-decodes the valid region + cats the raw tail.
+  `read()` decodes only the newly archived blocks (memoized `_rec`) and cats the
+  raw tail.
   **Do not** revert to "append a new archive tensor per full block + loop over
   archives in read" — with that fragmentation, per-token decoding measured 170×
   slower reads (31ms → 0.18ms at S=4096, launch overhead dominating).
@@ -134,8 +135,17 @@ Read this whole file before making changes.
 - `images/` holds the README screenshots and is maintained by the user — do not
   regenerate, replace, or commit new images unless explicitly asked.
 - `pyproject.toml` (setuptools, MIT, torch>=2.0); the version number is written in
-  both `pyproject.toml` and `flashcodec/__init__.py::__version__`, so changing one
-  requires syncing the other.
-- Before publishing to PyPI, run all three test groups + both benchmarks (the
-  measured tables in the README must be updated accordingly — every number in the
-  README was actually measured; no placeholders or stale data).
+  `pyproject.toml`, `flashcodec/__init__.py::__version__` **and the top
+  `CHANGELOG.md` entry**, so changing one requires syncing all three
+  (`uv lock` afterwards: the lock records the project's own name/version).
+- **Distribution name is `flashcodec-kv`, import name is `flashcodec`** — the bare
+  `flashcodec` name on PyPI is an unrelated 0.0.0 placeholder package, never
+  publish under it (rename only if the user confirms they own that name).
+- `.github/workflows/ci.yml` runs the three codec tests plus the transformers
+  integration test on CPU (Python 3.10 / 3.12, `pip install -e ".[hf]"`).
+  `requires-python = ">=3.10"` is driven by transformers 5.20; don't lower it
+  without also making the `hf` extra conditional, or `uv lock` fails.
+- Before publishing to PyPI, run all four test groups + both benchmarks + 
+  `benchmarks/run_qwen_demo.py` (the measured tables in the README must be updated
+  accordingly — every number in the README was actually measured; no placeholders
+  or stale data), then `uv build`.
