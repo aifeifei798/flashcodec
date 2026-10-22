@@ -64,9 +64,7 @@ MODES = {
 }
 DEFAULT_MODE = "jpeg k=2 int8 · ~7×"
 
-_CJK = ["Noto Sans SC", "Source Han Sans CN", "Noto Sans CJK SC",
-        "WenQuanYi Micro Hei", "SimHei", "PingFang SC", "Microsoft YaHei"]
-matplotlib.rcParams["font.sans-serif"] = _CJK + matplotlib.rcParams["font.sans-serif"]
+matplotlib.rcParams["font.sans-serif"] = ["DejaVu Sans", "Arial", "Helvetica"]
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
