@@ -8,6 +8,25 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [0.4.0] — 2026-10-23
+
+### Added
+
+- **`flashcodec/attention.py` — materialization-free decode attention.** Both
+  codecs are linear along the seq axis (`K_block = A @ S`), so a decode query
+  can attend on the stored rows: `q·K[p] = (q·S^T) @ A[p]` and
+  `out = (prob @ A) @ S`. Measured at 64K with jpeg k=2 int8: 0.86ms / 520MB
+  (materialized) → 0.46ms / 128MB (coefficient domain), maxdiff ≤ 1e-6.
+  Decode only; png is numerically supported but has no memory win.
+- **`per_layer` budgets** on `FlashCodecCache.from_config`, plus
+  `benchmarks/bench_adaptive.py` (per-layer sensitivity calibration).
+  Measured on Qwen3-0.6B: adaptive 40.83 ppl at 75% storage vs uniform k=6
+  48.05 at 75% and k=r int8 19.36 at 50% — calibration helps over uniform
+  truncation, but int8 remains the default because the damages are
+  super-additive.
+- `tests/test_attention.py` and a `benchmarks/bench_attention.py` memory/latency
+  benchmark.
+
 ## [0.3.0] — 2026-10-23
 
 ### Added

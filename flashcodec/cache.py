@@ -576,13 +576,17 @@ class FlashCodecCache(_HFCache):
 
     @classmethod
     def from_config(cls, config, mode="jpeg", block_size=8, keep_freqs=2,
-                    keep_ratio=1.0, quant_bits=0):
+                    keep_ratio=1.0, quant_bits=0, per_layer=None):
         """Build the mixed-layer list from the model config (Qwen3.5-style
         hybrid architectures): only full_attention layers get a codec layer,
         while the remaining layer types (linear_attention / sliding, etc.)
         keep their native dynamic layer — consistent with how
         DynamicCache(config=...) dispatches, so native interfaces such as
-        linear-attention recurrent state stay unaffected."""
+        linear-attention recurrent state stay unaffected.
+
+        ``per_layer`` overrides the codec config for individual layer indices,
+        e.g. ``{3: {"keep_freqs": 4}, 7: {"quant_bits": 8}}`` — this is how a
+        calibrated (non-uniform) budget is applied."""
         from transformers.cache_utils import (DYNAMIC_LAYER_TYPE_MAPPING,
                                               get_layer_types_and_kwargs)
         decoder = (config.get_text_config(decoder=True)
@@ -594,19 +598,23 @@ class FlashCodecCache(_HFCache):
                                        ["full_attention"] *
                                        getattr(decoder, "num_hidden_layers", 1)))
             per_layer_kwargs = [{} for _ in layer_types]
+        per_layer = per_layer or {}
         layers = []
-        for ltype, lkw in zip(layer_types, per_layer_kwargs):
+        for idx, (ltype, lkw) in enumerate(zip(layer_types, per_layer_kwargs)):
             if ltype == "full_attention":
-                layers.append(FlashCodecLayer(
-                    mode=mode, block_size=block_size, keep_freqs=keep_freqs,
-                    keep_ratio=keep_ratio, quant_bits=quant_bits))
+                cfg = dict(mode=mode, block_size=block_size,
+                           keep_freqs=keep_freqs, keep_ratio=keep_ratio,
+                           quant_bits=quant_bits)
+                cfg.update(per_layer.get(idx, {}))
+                layers.append(FlashCodecLayer(**cfg))
             else:
                 layers.append(DYNAMIC_LAYER_TYPE_MAPPING[ltype](**lkw))
         obj = cls.__new__(cls)
         _HFCache.__init__(obj, layers=layers, layer_class_to_replicate=None)
         obj.mode = mode
         obj.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
-                             keep_ratio=keep_ratio, quant_bits=quant_bits)
+                             keep_ratio=keep_ratio, quant_bits=quant_bits,
+                             per_layer=per_layer)
         return obj
 
     def codec_layer_indices(self):

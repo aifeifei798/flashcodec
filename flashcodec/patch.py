@@ -36,13 +36,15 @@ def _make_factory(mode, block_size, kwargs, sink, config=None):
     codec_kw = dict(keep_freqs=kwargs.get("keep_freqs", 2),
                     keep_ratio=kwargs.get("keep_ratio", 1.0),
                     quant_bits=kwargs.get("quant_bits", 0))
+    per_layer = kwargs.get("per_layer")
     if HAS_HF_CACHE:
         def factory():
             c = None
             if config is not None:      # hybrid architecture (e.g. Qwen3.5):
                 try:                    # only full-attention layers get a codec
                     c = FlashCodecCache.from_config(        # per layer_types
-                        config, mode=mode, block_size=block_size, **codec_kw)
+                        config, mode=mode, block_size=block_size,
+                        per_layer=per_layer, **codec_kw)
                 except Exception:
                     c = None
             if c is None:

@@ -190,6 +190,24 @@ def test_g_int8_generation():
         f"{plain.storage_bytes()}")
 
 
+def test_h_per_layer_schedule():
+    """from_config applies a calibrated per-layer budget (mixed keep_freqs /
+    quant_bits) and still generates."""
+    model = build_tiny_llama()
+    cache = FlashCodecCache.from_config(
+        model.config, mode="jpeg", block_size=8, keep_freqs=8,
+        per_layer={1: dict(keep_freqs=2, quant_bits=8)})
+    layers = cache.codec_layer_indices()
+    assert len(layers) == model.config.num_hidden_layers
+    assert cache.layers[0].codec.keep_freqs == 8
+    assert cache.layers[0].codec.quant_bits == 0
+    assert cache.layers[1].codec.keep_freqs == 2
+    assert cache.layers[1].codec.quant_bits == 8
+    out = gen(model, past_key_values=cache)
+    assert out.shape == (1, PROMPT_LEN + NEW)
+    assert cache.get_seq_length() == PROMPT_LEN + NEW - 1
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

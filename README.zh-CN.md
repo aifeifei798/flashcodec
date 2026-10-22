@@ -137,6 +137,32 @@ dtype 契约（详见 `AGENTS.md`）：PNG 差分恒为 fp32（bf16 差分会破
 档承诺的逐位精确性）；JPEG 系数与 `read()` 视图保持流输入 dtype
 （SDPA 要求 q/k/v 同 dtype）。
 
+## 免物化解码 attention
+
+这里的编解码沿 seq 轴都是**线性映射**：一个块的 r 个 token 满足
+`K_block = A @ S`，其中 `S` 是存储行（DCT 系数，或 anchor + 差分），`A` 是合成
+矩阵。于是解码查询可以直接在 `S` 上算：
+
+```
+q · K[p] = (q · S^T) @ A[p]        out = (prob @ A) @ S
+```
+
+`codec_decode_attention(q, key_stream, value_stream)` 实现单 token 版本（jpeg
+k<r、jpeg int8、png，含 GQA 分组）。`(S, D)` 的重构视图从不出现，结果与物化
+路径差 ≤1e-6。
+
+实测（`benchmarks/bench_attention.py`，B=1, H_kv=8, H_q=16, D=64, fp32）：
+
+| seq | 模式 | 物化路径 | 系数域路径 |
+|---|---|---|---|
+| 16384 | jpeg k=2 int8 | 0.20ms / 130MB | 0.30ms / **32MB** |
+| 65536 | jpeg k=2 int8 | 0.86ms / 520MB | **0.46ms / 128MB** |
+| 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
+
+适用范围：**仅解码**（prefill 仍走物化视图——系数形式会让 score 张量爆炸），
+且目前是参考 kernel，尚未接进 HF 各 attention 模块。png 每块存 r 行，数值上
+支持但省不了内存；收益来自 jpeg `k < r`（以及 int8，剩余峰值主要是反量化）。
+
 ## Demo（Qwen3.5-0.8B 左右对比 Chat）
 
 ![flashcodec Gradio 左右对比 demo](images/demo.png)
@@ -197,6 +223,23 @@ V 经常是**反**相关的（比值 > 1），所以「一阶差分让方差塌�
 混合架构结果好是因为只有 6/24 层挂了 codec（18 层线性注意力保留原生状态）；
 稠密模型那两列说明了为什么按层截断不能盲用。
 
+### 逐层预算（`benchmarks/bench_adaptive.py`，Qwen3-0.6B，6 × 512 token）
+
+校准方式：每次只把一层降到 k=4，测困惑度损伤；然后给损伤最小的那一半层
+k=4、其余保持 k=r（75% 存储）：
+
+| 方案 | ppl | Δppl | 存储 |
+|---|---|---|---|
+| baseline (k=r) | 18.9786 | — | 100% |
+| 均匀 k=6 | 48.0531 | +29.07 | 75% |
+| 自适应（14 层 k=4） | 40.8309 | +21.85 | 75% |
+| 均匀 k=4 | 710.22 | +691.24 | 50% |
+| 均匀 k=r int8 | 19.3627 | +0.38 | 50% |
+
+同样存储下校准比均匀分配好 15%，但损伤是**超线性叠加**的（最便宜的 14 层
+单独每个不超过 +0.5，合起来 +22），而 int8 在 50% 存储下好得多。所以把逐层
+截断当最后手段；确实需要时用 `per_layer={idx: {"keep_freqs": ...}}`。
+
 ### 缓存占用与耗时（`benchmarks/bench_vram.py`，CPU）
 
 | seq | 模式 | storage | 原始比 | fill | read |
@@ -226,8 +269,9 @@ flashcodec/
 │   ├── codecs/jpeg.py     # DCT-II 基底、投影/重构（纯 GEMM，无循环）
 │   ├── codecs/png.py      # Anchor + 一阶差分、cumsum 还原、Top-M 阈值滤波
 │   ├── cache.py           # CodecKVCache：raw 尾 + 倍增预分配归档，全量/增量双接口
+│   ├── attention.py       # 免物化解码 attention（系数域计算）
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
-├── tests/                 # jpeg / png / causal 三组测试（直接运行或 pytest）
+├── tests/                 # jpeg / png / causal / attention 四组测试（直接运行）
 ├── benchmarks/            # 显存/存储 + PSNR/余弦 + 困惑度压测
 ├── demo/                  # Gradio 左右对比 chat
 ├── images/                # README 截图
@@ -248,7 +292,9 @@ python tests/test_causal.py         # 未来扰动零泄露、增量 vs 全量 �
 python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
                                     # 显式缓存 / 热补丁 / PNG 无损逐 token 一致 /
                                     # 70 token 跨 8+ 块稳定性 / beam search 与 crop
-                                    # 对未打补丁模型的精确性
+                                    # 对未打补丁模型的精确性 / 逐层预算
+python tests/test_attention.py      # 系数域解码 attention 与物化路径一致
+                                    # （jpeg / int8 / png、GQA），且从不构建 KV 视图
 ```
 
 ## 边界与说明（诚实清单）

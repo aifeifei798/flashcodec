@@ -152,6 +152,36 @@ differences lose the bitwise-exactness the lossless tier promises); JPEG
 coefficients and `read()` views stay in the stream's input dtype (SDPA
 requires q/k/v dtype parity).
 
+## Materialization-free decode attention
+
+Every codec here is a **linear map along the seq axis**: the r tokens of a block
+are `K_block = A @ S`, where `S` are the stored rows (DCT coefficients, or
+anchor + deltas) and `A` is the synthesis matrix. So a decode query can attend
+on `S` directly:
+
+```
+q . K[p] = (q . S^T) @ A[p]        out = (prob @ A) @ S
+```
+
+`codec_decode_attention(q, key_stream, value_stream)` implements this for one
+new token (jpeg k<r, jpeg int8 and png; GQA grouping included). The `(S, D)`
+reconstruction never exists, and the result matches the materialized path to
+≤1e-6.
+
+Measured (`benchmarks/bench_attention.py`, B=1, H_kv=8, H_q=16, D=64, fp32):
+
+| seq | mode | materialized | coefficient-domain |
+|---|---|---|---|
+| 16384 | jpeg k=2 int8 | 0.20ms / 130MB | 0.30ms / **32MB** |
+| 65536 | jpeg k=2 int8 | 0.86ms / 520MB | **0.46ms / 128MB** |
+| 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
+
+Scope: **decode only** (prefill still uses the view — the coefficient form would
+explode the score tensor), and it is a reference kernel, not yet wired into HF
+attention modules. png stores r rows per block, so it is numerically supported
+but gains nothing; the win is jpeg `k < r` (and int8, whose dequantization is
+the remaining peak).
+
 ## Demo (side-by-side chat on Qwen3.5-0.8B)
 
 ![flashcodec side-by-side Gradio demo](images/demo.png)
@@ -216,6 +246,26 @@ The hybrid result is good because only 6 of 24 layers carry a codec (the 18
 linear-attention layers keep their native state); the dense model shows why
 per-layer truncation must not be applied blindly.
 
+### Per-layer budgets (`benchmarks/bench_adaptive.py`, Qwen3-0.6B, 6 × 512 tokens)
+
+Calibration: compress one layer at a time to k=4, measure the perplexity damage,
+then give the cheapest half of the layers k=4 and leave the rest at k=r (75%
+storage):
+
+| schedule | ppl | Δppl | storage |
+|---|---|---|---|
+| baseline (k=r) | 18.9786 | — | 100% |
+| uniform k=6 | 48.0531 | +29.07 | 75% |
+| adaptive (14 layers k=4) | 40.8309 | +21.85 | 75% |
+| uniform k=4 | 710.22 | +691.24 | 50% |
+| uniform k=r int8 | 19.3627 | +0.38 | 50% |
+
+Calibration beats a uniform budget at the same storage (−15%), but the damages
+are **super-additive** (the cheapest 14 layers add up to +22 ppl although no
+single one costs more than +0.5), and int8 at 50% is far better. Use
+`per_layer={idx: {"keep_freqs": ...}}` when a budget forces structural
+truncation; otherwise prefer `quant_bits=8`.
+
 ### Cache footprint & latency (`benchmarks/bench_vram.py`, CPU)
 
 | seq | Mode | storage | ratio | fill | read |
@@ -247,8 +297,9 @@ flashcodec/
 │   ├── codecs/jpeg.py     # DCT-II basis, project/reconstruct (pure GEMM, no loops)
 │   ├── codecs/png.py      # anchor + first-order delta, cumsum, Top-M filter
 │   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
+│   ├── attention.py       # materialization-free decode attention (coefficient domain)
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
-├── tests/                 # jpeg / png / causal suites (standalone scripts or pytest)
+├── tests/                 # jpeg / png / causal / attention suites (standalone scripts)
 ├── benchmarks/            # storage + PSNR/cosine + perplexity benchmarks
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
@@ -268,7 +319,10 @@ python tests/test_causal.py         # zero future leakage, incremental vs full �
                                    # beam-search batch gather
 python tests/test_hf_integration.py # native transformers 5.x generate: explicit cache / hot patch /
                                     # PNG lossless exact tokens / 70-token multi-block stability /
-                                    # beam search + crop exactness against the unpatched model
+                                    # beam search + crop exactness against the unpatched model /
+                                    # per-layer schedule
+python tests/test_attention.py      # coefficient-domain decode attention matches the materialized
+                                    # path (jpeg / int8 / png, GQA); never builds the KV view
 ```
 
 ## Boundaries (honest list)

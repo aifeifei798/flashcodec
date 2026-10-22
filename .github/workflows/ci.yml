@@ -26,11 +26,12 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -e ".[hf]"
 
-      - name: Codec tests (jpeg / png / causal)
+      - name: Codec tests (jpeg / png / causal / attention)
         run: |
           python tests/test_jpeg.py
           python tests/test_png.py
           python tests/test_causal.py
+          python tests/test_attention.py
 
       - name: Transformers 5.x integration
         run: python tests/test_hf_integration.py

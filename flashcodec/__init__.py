@@ -10,6 +10,7 @@ Two classic compression theories ported to Transformer KV cache management:
 Tensor contract: KV layout (B, H, S, D), compression axis dim=-2 (seq axis).
 """
 
+from .attention import block_basis, codec_decode_attention
 from .cache import HAS_HF_CACHE, CodecKVCache, FlashCodecCache, \
     FlashCodecLayer, make_codec
 from .codecs import JPEGCodec, PNGCodec, dct_basis, dct_compress, \
@@ -18,13 +19,14 @@ from .codecs import JPEGCodec, PNGCodec, dct_basis, dct_compress, \
 from .patch import apply_flash_codec, find_attention_modules, \
     remove_flash_codec, undo_flash_codec
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",
     "find_attention_modules",
     "CodecKVCache", "FlashCodecCache", "FlashCodecLayer", "make_codec",
     "HAS_HF_CACHE", "JPEGCodec", "PNGCodec",
+    "codec_decode_attention", "block_basis",
     "dct_basis", "dct_compress", "dct_decompress",
     "quantize_coeffs", "dequantize_coeffs",
     "png_filter", "png_reconstruct",

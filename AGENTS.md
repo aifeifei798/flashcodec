@@ -128,6 +128,25 @@ Read this whole file before making changes.
   but peak memory ≈ raw KV + archive because `read()` materializes a view;
   memory wins need materialization-free kernels (flash-attention style).
 
+## Materialization-free decode attention (`flashcodec/attention.py`)
+
+- Both codecs are linear along seq: the r tokens of a block are `A @ S` (jpeg:
+  `A = M^T` (r,k), `S` = coeffs or dequantized int8; png: `A = tril(ones)`,
+  `S = [anchor; deltas]`). Therefore `q·K[p] = (q·S^T) A[p]` and
+  `out = (prob·A) S` — decode attention without ever building the view.
+  GQA is grouped over query heads; never `repeat_interleave` the stored rows.
+- **Decode only** (`Sq == 1`); prefill would blow up the score tensor. png is
+  numerically supported but stores r rows per block, so it saves nothing — the
+  win is jpeg `k < r`. Remaining peak is the int8→fp32 dequantization of rows.
+- Measured (B=1 H_kv=8 H_q=16 D=64 fp32, 64K): materialized 0.86ms/520MB →
+  coefficient 0.46ms/128MB. Not wired into HF attention modules yet; it is a
+  reference kernel covered by `tests/test_attention.py`.
+- `per_layer={idx: {keep_freqs/quant_bits/...}}` on `from_config` applies a
+  calibrated schedule. Measured Qwen3-0.6B: adaptive (cheapest 14 layers at k=4)
+  40.83 ppl at 75% storage vs uniform k=6 48.05 at 75% and uniform k=r int8
+  19.36 at 50%. Per-layer damages are super-additive — truncation is a last
+  resort, int8 is the default. Repro: `benchmarks/bench_adaptive.py`.
+
 ## Design decisions (don't "refactor these away" in passing)
 
 - **The HF hot patch lives in the Cache layer, not the attention kernel**: KV
