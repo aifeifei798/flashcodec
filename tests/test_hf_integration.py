@@ -126,6 +126,52 @@ def test_d_long_stability():
             f"{mode} storage not compressed: {cache.storage_bytes()} vs raw {raw}"
 
 
+def test_e_beam_search_lossless_exact():
+    """Beam search exercises batch expansion + reorder_cache (archives must be
+    gathered, not just the materialized view): the PNG lossless tier still
+    matches the unpatched model token for token."""
+    base = build_tiny_llama()
+    ref = gen(base, num_beams=3)
+    apply_flash_codec(base, mode="png", block_size=8, keep_ratio=1.0)
+    out = gen(base, num_beams=3)
+    assert torch.equal(ref, out), (
+        f"beam search diverged on the lossless tier: ref={ref[0, -NEW:].tolist()} "
+        f"got={out[0, -NEW:].tolist()}")
+
+
+def test_f_crop_matches_unpatched():
+    """crop (speculative decoding) keeps the exact surviving prefix and a
+    correct boundary: after cropping 5 tokens the next-token logits agree with
+    the unpatched model fed the same truncated prefix."""
+    base = build_tiny_llama()
+    ref_model = build_tiny_llama()               # same seed => same weights
+    apply_flash_codec(base, mode="png", block_size=8, keep_ratio=1.0)
+    cache = FlashCodecCache(mode="png", block_size=8, keep_ratio=1.0)
+    with torch.no_grad():
+        out = base.generate(input_ids=PROMPT(), do_sample=False,
+                            pad_token_id=0, max_new_tokens=NEW,
+                            past_key_values=cache)
+    total = out.shape[1]
+    assert cache.get_seq_length() == total - 1
+    before = [layer.keys.clone() for layer in cache.layers]
+    cache.crop(-5)
+    assert cache.get_seq_length() == total - 6
+    for li, layer in enumerate(cache.layers):
+        assert torch.equal(layer.keys, before[li][..., :total - 6, :]), \
+            f"layer {li}: crop rewrote the surviving prefix"
+
+    # continue one step from the cropped cache vs the unpatched model
+    next_tok = out[:, total - 6:total - 5]
+    with torch.no_grad():
+        ours = base(input_ids=next_tok, past_key_values=cache,
+                    use_cache=True).logits[:, -1, :]
+        ref = ref_model(input_ids=out[:, :total - 5]).logits[:, -1, :]
+    d = (ours - ref).abs().max().item()
+    assert torch.equal(ours.argmax(-1), ref.argmax(-1)), \
+        f"crop boundary changed the next token (maxdiff={d:.2e})"
+    assert d < 1e-2, f"crop boundary logits drifted: maxdiff={d:.2e}"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

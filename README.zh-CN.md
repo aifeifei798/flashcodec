@@ -40,8 +40,9 @@
 ```
 
 归档存放在**单块几何倍增缓冲区**里（std::vector 式：初始 16 块，装满翻倍）。
-每满块只做一次原地切片写入（无反复重新分配）；`read()` 对有效区做单次批量
-GEMM / cumsum。若改成逐块碎片归档 + 逐归档循环解压，S=4096 的逐步解码
+每满块只做一次原地切片写入（无反复重新分配）；`read()` 只解码**新增归档块**
+（每个新块一次批量 GEMM / cumsum，落在追加式重构缓存里），不再每个 decode step
+重解全部历史。若改成逐块碎片归档 + 逐归档循环解压，S=4096 的逐步解码
 read 会因 kernel launch 开销慢约 170×（实测 31ms → 0.18ms）。
 
 ## 因果安全设计
@@ -111,9 +112,9 @@ Qwen3.5-0.8B 实测（bf16、CUDA、48 个贪心 token，`benchmarks/run_qwen_de
 
 | 档位 | 存储 vs raw KV | 输出 | 结论 |
 |---|---|---|---|
-| `png keep=1.0` | ~1.9×（fp32 差分换精确）| **生成 token 与未打补丁模型逐位一致** | 100% 保真基线 |
-| `jpeg k=2` | **27.6%**（约 4×）| 文本流畅，token 一致率 28.8% | 有损档 |
-| `jpeg k=4` | 51.7%（约 2×）| 文本流畅，token 一致率 35.6% | 有损档 |
+| `png keep=1.0` | ~1.8×（fp32 差分换精确）| **生成 token 与未打补丁模型逐位一致** | 100% 保真基线 |
+| `jpeg k=2` | **32.3%**（约 3.1×）| 文本流畅，token 一致率 38.1% | 有损档 |
+| `jpeg k=4` | 54.8%（约 1.8×）| 文本流畅，token 一致率 49.2% | 有损档 |
 
 混合层审计：`codec_layers=6/24`（仅全注意力层），零警告。复跑：
 `python benchmarks/run_qwen_demo.py`（离线加载；支持 `FLASHCODEC_MODEL` /
@@ -144,7 +145,7 @@ python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
 |---|---|---|---|
 | jpeg r=8 k=1（8×） | 42.95 | 0.99943 | 12.5% |
 | jpeg r=8 k=2（4×） | 47.22 | 0.99985 | 25.0% |
-| jpeg r=8 k=4（2×） | 51.66 | 1.00000 | 50.0% |
+| jpeg r=8 k=4（2×） | 51.66 | 1.00001 | 50.0% |
 | png r=8 keep=0.5 | 50.11 | 0.99997 | 100%（稀疏留熵编码）|
 | png r=8 keep=1.0 | ~196（fp 舍入级）| 1.00000 | 100% |
 
@@ -152,10 +153,14 @@ python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
 
 | seq | 模式 | storage | 原始比 | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 15.1ms | 2.0ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 29.8ms | 13.4ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 103.9ms | 38.7ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 209.5ms | 71.9ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 8.2ms | 0.5ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 28.1ms | 2.1ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 105.0ms | 5.2ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 196.6ms | 8.0ms |
+
+`read` 为「物化视图并真实读取（`.sum()`）」的耗时，即消费端成本而非仅 kernel
+启动。解码按归档块记忆化，`read` 只在**新增块**上做一次解码，不再每个 decode
+step 重解全部历史（此前最后两行为 38.7ms / 71.9ms）。
 
 PNG 模式不省稠密存储（无损基线的宿命）——它的价值在 30× 方差压缩 + Top-M
 近零稀疏残差，是熵编码器的理想输入（本库不内置熵编码）。
@@ -183,21 +188,26 @@ flashcodec/
 ```bash
 python tests/test_jpeg.py           # 正交归一、K=r 无损、k=2 余弦>0.99、K 单调
 python tests/test_png.py            # 无损 maxdiff<1e-6、方差压缩比打印、可微
-python tests/test_causal.py         # 未来扰动零泄露、增量 vs 全量 ≤1e-4
+python tests/test_causal.py         # 未来扰动零泄露、增量 vs 全量 ≤1e-4、
+                                    # 记忆化 read 与全量解码逐位一致、crop 精确且可重复、
+                                    # beam search 批维重排
 python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
                                     # 显式缓存 / 热补丁 / PNG 无损逐 token 一致 /
-                                    # 70 token 跨 8+ 块稳定性
+                                    # 70 token 跨 8+ 块稳定性 / beam search 与 crop
+                                    # 对未打补丁模型的精确性
 ```
 
 ## 边界与说明（诚实清单）
 
 - 研究原型：`read()` 物化完整重构视图参与注意力，显存收益在**缓存存储层**
-  （如上表）；与 flash-attention 类不物化内核结合才能量化端到端收益。
+  （如上表）；与 flash-attention 类不物化内核结合才能量化端到端收益。该视图
+  被记忆化并跨 decode step 复用，因此稳态显存 = 归档 + 一份原始 KV 大小的视图。
 - 全量 `forward(seq)` 预填会把完整块直接压缩，块内位置的注意力会看到块级
   重构（块内近似）；增量 `decode_step` 路径无此问题（当前块恒为 raw）。
 - 压缩张量为稠密布局；PNG 的 Top-M 稀疏性尚未接熵编码器。
-- 与 [Mini-Architecture](../README.md) 中 v4.2 原型（模型内 KV 复用层的
-  DCT/差分读取）同源：那里是"每位置视图"语义，这里是标准 cache 存储语义。
+- 与 [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
+  中 v4.2 原型（模型内 KV 复用层的 DCT/差分读取）同源：那里是"每位置视图"
+  语义，这里是标准 cache 存储语义。
 
 ## License
 

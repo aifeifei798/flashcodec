@@ -38,9 +38,21 @@ Read this whole file before making changes.
   early (disable it with `generation_config.eos_token_id = None`); scaling lm_head
   by 20 creates a clear argmax margin, isolating tie jitter and focusing on the
   cache mechanism.
-- `crop` (speculative decoding path): rebuilds the archive from the cropped view
-  (prototype semantics); `offload/prefetch` are no-ops; beam search
-  (reorder_cache) is unsupported.
+- `crop` (speculative decoding path) is exact: archived blocks are kept
+  verbatim, only the boundary partial block returns to the raw tail (no
+  re-compression, so repeated crops are idempotent); `reorder_cache` /
+  `batch_repeat_interleave` / `batch_select_indices` gather the archive + tail too
+  (beam search is bitwise-identical on the lossless tier); `offload/prefetch` are
+  still no-ops.
+- `_CodecStream.read()` is **memoized**: decoded archive blocks are kept in a
+  persistent append-only `_rec` buffer (one decode per new block instead of
+  re-decoding the whole history per decode step — measured 38.7ms → 5.2ms at
+  S=64K in bench_vram). Two consequences not to "optimize away": (1) `read()`
+  returns a **view** into `_rec` when the raw tail is empty, so structural ops
+  must not write the live region in place (`select_batch` allocates a new buffer;
+  `reset()` is the explicit invalidation point); (2) the reconstruction buffer is
+  persistent, so steady-state memory includes one raw-KV-sized view (before, it was
+  a per-read temporary — peak is unchanged, steady state is higher).
 
 ## dtype contract (distilled from Qwen3.5-0.8B practice; read before changing codecs)
 

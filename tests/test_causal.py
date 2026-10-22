@@ -113,6 +113,75 @@ def test_incremental_vs_full_attention_lossless():
         f"incremental decoding disagrees with full forward: maxdiff={d:.2e}"
 
 
+def test_memoized_read_matches_fresh_stream():
+    """The incremental (memoized) decode must be bitwise-identical to decoding
+    the whole archive in one shot — i.e. a freshly filled cache of the same
+    prefix."""
+    for mode, kw in (("jpeg", dict(keep_freqs=2)),
+                     ("png", dict(keep_ratio=1.0))):
+        c = CodecKVCache(mode=mode, block_size=R, **kw)
+        for t in range(S):
+            c.decode_step(k_seq[..., t:t + 1, :], v_seq[..., t:t + 1, :])
+            if t % 13 == 0 or t == S - 1:
+                fresh = CodecKVCache(mode=mode, block_size=R, **kw)
+                fresh.forward(k_seq[..., :t + 1, :], v_seq[..., :t + 1, :])
+                assert torch.equal(c.key_cache[0], fresh.key_cache[0]), \
+                    f"{mode}: memoized read diverged at t={t}"
+                assert torch.equal(c.value_cache[0], fresh.value_cache[0]), \
+                    f"{mode}: memoized value read diverged at t={t}"
+
+
+def test_crop_exact_and_repeatable():
+    """crop is exact (equal to truncating the view) and idempotent under
+    repeated crops — the old rebuild-from-view path re-compressed the history
+    and added loss on every crop."""
+    for mode, kw in (("png", dict(keep_ratio=1.0)),
+                     ("jpeg", dict(keep_freqs=2))):
+        c = _fill_incr(mode, block_size=R, **kw)
+        k_ref = c.key_cache[0].clone()
+        v_ref = c.value_cache[0].clone()
+
+        c.crop(-5)                                # crosses a block boundary
+        assert c.get_seq_length(0) == S - 5
+        assert torch.equal(c.key_cache[0], k_ref[..., :-5, :]), \
+            f"{mode}: crop is not exact"
+        assert torch.equal(c.value_cache[0], v_ref[..., :-5, :])
+
+        c2 = _fill_incr(mode, block_size=R, **kw)
+        c2.crop(-2)
+        c2.crop(-3)                               # repeated crop
+        assert torch.equal(c2.key_cache[0], k_ref[..., :-5, :]), \
+            f"{mode}: repeated crops accumulated loss"
+
+        c3 = _fill_incr(mode, block_size=R, **kw)
+        c3.crop(-S)                               # drop everything
+        assert c3.get_seq_length(0) == 0
+        c4 = _fill_incr(mode, block_size=R, **kw)
+        c4.crop(-(S - 3 * R))                     # land exactly on a boundary
+        assert torch.equal(c4.key_cache[0], k_ref[..., :3 * R, :])
+
+
+def test_reorder_cache_matches_batch_permutation():
+    """Beam-search batch gather must permute the archives, not just the
+    materialized view."""
+    b = 4
+    kb = torch.randn(b, H, S, D)
+    vb = torch.randn(b, H, S, D)
+    idx = torch.tensor([2, 0, 3, 1])
+    for mode, kw in (("png", dict(keep_ratio=1.0)),
+                     ("jpeg", dict(keep_freqs=2))):
+        c = CodecKVCache(mode=mode, block_size=R, **kw)
+        k_ref, v_ref = c.forward(kb, vb)
+        c.reorder_cache(idx)
+        assert torch.equal(c.key_cache[0], k_ref.index_select(0, idx)), \
+            f"{mode}: reorder_cache did not permute the archive"
+        assert torch.equal(c.value_cache[0], v_ref.index_select(0, idx))
+        # and the streams stay usable after the gather
+        c.decode_step(kb.index_select(0, idx)[..., :1, :],
+                      vb.index_select(0, idx)[..., :1, :])
+        assert c.get_seq_length(0) == S + 1
+
+
 def test_forward_fill_vs_incremental_view_bitwise():
     c1 = CodecKVCache(mode="png", block_size=R, keep_ratio=1.0)
     k1, v1 = c1.forward(k_seq, v_seq)

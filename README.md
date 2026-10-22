@@ -46,9 +46,11 @@ Math (block size `r`, operating axis `dim=-2`):
 
 Archives live in a **single geometrically-grown buffer** (std::vector-style:
 start at 16 blocks, double on overflow). Each full block is one in-place
-slice write — no re-allocation churn — and `read()` is a single batched
-GEMM / cumsum over the active region. (Fragmented per-block archive lists
-made per-token decode ~170× slower at S=4096 due to kernel-launch overhead.)
+slice write — no re-allocation churn — and `read()` decodes **only the
+newly archived blocks** (one batched GEMM / cumsum per new block, memoized
+in an append-only reconstruction buffer) instead of re-decoding the whole
+history on every decode step. (Fragmented per-block archive lists made
+per-token decode ~170× slower at S=4096 due to kernel-launch overhead.)
 
 ## Causal-safety design
 
@@ -122,9 +124,9 @@ Measured on Qwen3.5-0.8B (bf16, CUDA, 48 greedy tokens, `benchmarks/run_qwen_dem
 
 | Tier | Storage vs raw KV | Output | Verdict |
 |---|---|---|---|
-| `png keep=1.0` | ~1.9× (fp32 deltas for exactness) | **bit-identical tokens to the unpatched model** | 100% fidelity baseline |
-| `jpeg k=2` | **27.6%** (~4×) | fluent, 28.8% token match | lossy tier |
-| `jpeg k=4` | 51.7% (~2×) | fluent, 35.6% token match | lossy tier |
+| `png keep=1.0` | ~1.8× (fp32 deltas for exactness) | **bit-identical tokens to the unpatched model** | 100% fidelity baseline |
+| `jpeg k=2` | **32.3%** (~3.1×) | fluent, 38.1% token match | lossy tier |
+| `jpeg k=4` | 54.8% (~1.8×) | fluent, 49.2% token match | lossy tier |
 
 Hybrid-layer audit: `codec_layers=6/24` (full attention only), zero warnings.
 Reproduce with `python benchmarks/run_qwen_demo.py` (offline; honors
@@ -156,7 +158,7 @@ python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
 |---|---|---|---|
 | jpeg r=8 k=1 (8×) | 42.95 | 0.99943 | 12.5% |
 | jpeg r=8 k=2 (4×) | 47.22 | 0.99985 | 25.0% |
-| jpeg r=8 k=4 (2×) | 51.66 | 1.00000 | 50.0% |
+| jpeg r=8 k=4 (2×) | 51.66 | 1.00001 | 50.0% |
 | png r=8 keep=0.5 | 50.11 | 0.99997 | 100% (sparsity → entropy coder) |
 | png r=8 keep=1.0 | ~196 (fp rounding) | 1.00000 | 100% |
 
@@ -164,10 +166,15 @@ python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
 
 | seq | Mode | storage | ratio | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 15.1ms | 2.0ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 29.8ms | 13.4ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 103.9ms | 38.7ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 209.5ms | 71.9ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 8.2ms | 0.5ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 28.1ms | 2.1ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 105.0ms | 5.2ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 196.6ms | 8.0ms |
+
+`read` = materialize the view and touch it (`.sum()`, so the number is the
+consumer cost, not just kernel launch). Decoding is memoized per archived block,
+so `read` costs one decode per **new** block instead of re-decoding the whole
+history on every decode step (previously 38.7ms / 71.9ms in the last two rows).
 
 PNG does not shrink dense storage (the fate of a lossless tier) — its value is
 the 30× variance collapse plus near-zero sparse residuals after Top-M, i.e.
@@ -196,9 +203,12 @@ flashcodec/
 ```bash
 python tests/test_jpeg.py           # orthonormality, k=r lossless, k=2 cosine>0.99, K monotone
 python tests/test_png.py            # lossless maxdiff<1e-6, variance ratio printed, differentiable
-python tests/test_causal.py         # zero future leakage, incremental vs full ≤1e-4
+python tests/test_causal.py         # zero future leakage, incremental vs full ≤1e-4,
+                                   # memoized read == full decode, exact + repeatable crop,
+                                   # beam-search batch gather
 python tests/test_hf_integration.py # native transformers 5.x generate: explicit cache / hot patch /
-                                    # PNG lossless exact tokens / 70-token multi-block stability
+                                    # PNG lossless exact tokens / 70-token multi-block stability /
+                                    # beam search + crop exactness against the unpatched model
 ```
 
 ## Boundaries (honest list)
@@ -206,7 +216,8 @@ python tests/test_hf_integration.py # native transformers 5.x generate: explicit
 - Research prototype: `read()` materializes the full reconstructed view for
   attention; memory gains are at the **cache storage layer** (table above);
   end-to-end benefits require combining with materialization-free kernels
-  (flash-attention style).
+  (flash-attention style). That view is memoized and reused across decode
+  steps, so steady-state memory = archive + one raw-KV-sized view.
 - Full-sequence `forward(seq)` prefill compresses complete blocks directly, so
   mid-block attention sees the block-level reconstruction (within-block
   approximation); the incremental `decode_step` path has no such issue.

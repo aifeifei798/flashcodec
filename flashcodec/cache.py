@@ -70,6 +70,11 @@ class _CodecStream:
         self._coeffs = None      # jpeg: (B,H,capacity,k,D)
         self._deltas = None      # png:  (B,H,capacity,r-1,D) fp32
         self._anchors = None     # png:  (B,H,capacity,D)
+        # Incrementally decoded archive (append-only, one decode per new
+        # block instead of re-decoding the whole history on every read).
+        self._rec = None         # (B,H,_rec_capacity,D) input dtype
+        self._rec_blocks = 0     # blocks already materialized into _rec
+        self._rec_capacity = 0   # tokens allocated in _rec
 
     @property
     def block_size(self):
@@ -134,21 +139,52 @@ class _CodecStream:
         self.raw = (buf[..., n_full * r:, :].contiguous()
                     if total > n_full * r else None)
 
-    def read(self):
-        """Reconstructed view (B,H,S,D): a single decode of the valid archive
-        region + concatenation of the raw tail.
-        Everything is restored to the stream input dtype (attention q/k/v dtype
-        contract)."""
-        if self.n_blocks == 0:
-            return self.raw
+    def _decode_pending(self):
+        """Materialize archive blocks that were added since the last read.
+
+        The archive is append-only (causal-safety invariant), so the decoded
+        prefix never changes: decoding only the new blocks makes `read()` O(new
+        blocks) amortized instead of O(history) on every decode step."""
+        if self._rec_blocks >= self.n_blocks:
+            return
+        r = self.block_size
+        a, b = self._rec_blocks, self.n_blocks
+        like = self._coeffs if self.codec.name == "jpeg" else self._deltas
+        if self._rec is None or self._rec.shape[-2] < b * r:
+            cap = max(b * r, self._rec_capacity * 2,
+                      self._INITIAL_BLOCKS * r)
+            new = torch.empty((like.shape[0], like.shape[1], cap,
+                               like.shape[-1]),
+                              dtype=self.dtype, device=like.device)
+            if self._rec is not None and self._rec_blocks:
+                done = self._rec_blocks * r
+                new[:, :, :done].copy_(self._rec[:, :, :done])
+            self._rec, self._rec_capacity = new, cap
         if self.codec.name == "jpeg":
-            rec = dct_decompress(self._coeffs[:, :, :self.n_blocks],
-                                 self.block_size)
+            rec = dct_decompress(self._coeffs[:, :, a:b], r)
             if rec.dtype != self.dtype:
                 rec = rec.to(self.dtype)
         else:
-            rec = png_reconstruct(self._deltas[:, :, :self.n_blocks],
-                                  self._anchors[:, :, :self.n_blocks])
+            rec = png_reconstruct(self._deltas[:, :, a:b],
+                                  self._anchors[:, :, a:b])
+        self._rec[:, :, a * r:b * r].copy_(rec)
+        self._rec_blocks = b
+
+    def read(self):
+        """Reconstructed view (B,H,S,D): one decode of the newly archived
+        blocks (memoized, append-only) + concatenation of the raw tail.
+        Everything is restored to the stream input dtype (attention q/k/v dtype
+        contract).
+
+        When the raw tail is empty the result is a view into the internal
+        reconstruction buffer; appends only ever write past `seq_len`, and
+        structural ops (crop / beam gather) never write into the live region
+        in place, so a tensor handed out earlier stays valid (until an
+        explicit `reset()`)."""
+        if self.n_blocks == 0:
+            return self.raw
+        self._decode_pending()
+        rec = self._rec[:, :, :self.n_archived]
         if self.raw is not None:
             rec = torch.cat([rec, self.raw], dim=-2)
         return rec
@@ -159,6 +195,97 @@ class _CodecStream:
         self.raw = None
         self.n_archived = 0
         self.n_blocks = 0
+        self._rec_blocks = 0
+
+    def crop(self, tokens_to_remove):
+        """Remove trailing tokens exactly (negative count, HF semantics).
+
+        Already-archived blocks are kept verbatim; only the partial block at
+        the new boundary is re-exposed as a raw tail, taking its values from
+        the current reconstruction. So a crop never re-compresses the history
+        and never adds loss — unlike a rebuild-from-view crop, repeated crops
+        are idempotent."""
+        if tokens_to_remove > 0:
+            raise ValueError("crop only supports negative values "
+                             "(remove trailing tokens)")
+        if tokens_to_remove == 0:
+            return
+        r = self.block_size
+        keep = max(0, self.seq_len - abs(tokens_to_remove))
+        keep_blocks = keep // r
+        tail = keep - keep_blocks * r
+        if keep_blocks < self.n_blocks:
+            self._decode_pending()          # boundary tokens come from the view
+            self.n_blocks = keep_blocks
+            self.n_archived = keep_blocks * r
+            self._rec_blocks = min(self._rec_blocks, keep_blocks)
+            self.raw = (self._rec[:, :, keep_blocks * r:keep, :].clone()
+                        if tail else None)
+        elif tail == 0:
+            self.raw = None
+        else:
+            self.raw = self.raw[..., :tail, :].contiguous()
+
+    def select_batch(self, idx):
+        """Gather rows of the batch dim (beam-search reorder / batch ops)."""
+        if self.raw is None and self.n_blocks == 0 and self._rec is None:
+            return
+        like = (self.raw if self.raw is not None else
+                (self._coeffs if self.codec.name == "jpeg" else self._deltas))
+        idx = idx.to(like.device)
+        r = self.block_size
+        if idx.numel() == like.shape[0]:        # same batch size: in-place
+            if self.raw is not None:
+                self.raw = self.raw.index_select(0, idx)
+            if self.n_blocks:
+                for t in self._archive_tensors():
+                    t[:, :, :self.n_blocks] = t[:, :, :self.n_blocks].index_select(
+                        0, idx)
+            if self._rec is not None and self._rec_blocks:
+                done = self._rec_blocks * r
+                # allocate instead of writing in place: read() may have handed
+                # out views into the current reconstruction buffer
+                new_r = torch.empty_like(self._rec)
+                new_r[:, :, :done] = self._rec[:, :, :done].index_select(
+                    0, idx)
+                self._rec = new_r
+            return
+        B, H, D = idx.numel(), like.shape[1], like.shape[-1]
+        if self.codec.name == "jpeg":
+            new = torch.empty((B, H, self._capacity, self.codec.keep_freqs, D),
+                              dtype=self._coeffs.dtype, device=like.device)
+            if self.n_blocks:
+                new[:, :, :self.n_blocks] = self._coeffs[
+                    :, :, :self.n_blocks].index_select(0, idx)
+            self._coeffs = new
+        else:
+            new_d = torch.empty((B, H, self._capacity, r - 1, D),
+                                dtype=torch.float32, device=like.device)
+            new_a = torch.empty((B, H, self._capacity, D),
+                                dtype=self._anchors.dtype, device=like.device)
+            if self.n_blocks:
+                new_d[:, :, :self.n_blocks] = self._deltas[
+                    :, :, :self.n_blocks].index_select(0, idx)
+                new_a[:, :, :self.n_blocks] = self._anchors[
+                    :, :, :self.n_blocks].index_select(0, idx)
+            self._deltas, self._anchors = new_d, new_a
+        if self._rec is not None:
+            new_r = torch.empty((B, H, self._rec_capacity, D),
+                                dtype=self._rec.dtype, device=like.device)
+            if self._rec_blocks:
+                done = self._rec_blocks * r
+                new_r[:, :, :done] = self._rec[:, :, :done].index_select(0, idx)
+            self._rec = new_r
+        if self.raw is not None:
+            self.raw = self.raw.index_select(0, idx)
+        if self.meta is not None:
+            self.meta = (B,) + self.meta[1:]
+
+    def _archive_tensors(self):
+        """Live archive tensors (shared by batch ops)."""
+        if self.codec.name == "jpeg":
+            return (self._coeffs,)
+        return (self._deltas, self._anchors)
 
     @property
     def seq_len(self):
@@ -231,6 +358,20 @@ class CodecKVCache:
         else:
             self._keys.pop(layer_idx, None)
             self._values.pop(layer_idx, None)
+
+    def crop(self, tokens_to_remove, layer_idx=None):
+        """Exact trailing-token removal (negative count) for one or all layers."""
+        for store in (self._keys, self._values):
+            for i, st in store.items():
+                if layer_idx is None or i == layer_idx:
+                    st.crop(tokens_to_remove)
+
+    def reorder_cache(self, beam_idx, layer_idx=None):
+        """Beam search: gather the batch dim of one or all layers."""
+        for store in (self._keys, self._values):
+            for i, st in store.items():
+                if layer_idx is None or i == layer_idx:
+                    st.select_batch(beam_idx)
 
     # ---------- HF Cache duck typing ----------
     @property
@@ -321,21 +462,51 @@ class FlashCodecLayer(_HFDynamicLayer):
         return -1                            # dynamic cache, no upper bound
 
     def crop(self, tokens_to_remove):
-        """Speculative decoding and similar paths crop the cache: rebuild the
-        archive from the cropped reconstructed view (prototype semantics:
-        rebuilding filters the already-compressed part once more)."""
-        if tokens_to_remove > 0:
-            raise ValueError("crop only supports negative values "
-                             "(remove trailing tokens)")
-        if tokens_to_remove == 0:
+        """Exact trailing-token removal (speculative decoding). Archived blocks
+        are kept verbatim; only the boundary partial block falls back into the
+        raw tail, so cropping never re-compresses and never adds loss."""
+        self._key_stream.crop(tokens_to_remove)
+        self._value_stream.crop(tokens_to_remove)
+        self._rebuild_views()
+
+    def reorder_cache(self, beam_idx):
+        """Beam search: gather the batch dim of both streams. The archive and
+        the raw tail have to be reordered too — reordering only the
+        materialized view would silently corrupt the next read."""
+        self._key_stream.select_batch(beam_idx)
+        self._value_stream.select_batch(beam_idx)
+        self._rebuild_views()
+
+    def batch_repeat_interleave(self, repeats):
+        """Contrastive search: replicate batch rows (archives included)."""
+        if not self.is_initialized:
             return
-        self._key_stream.reset()
-        self._value_stream.reset()
-        self.keys = self.keys[..., :tokens_to_remove, :]
-        self.values = self.values[..., :tokens_to_remove, :]
-        if self.keys.shape[-2] > 0:
-            self._key_stream.append(self.keys)
-            self._value_stream.append(self.values)
+        idx = torch.arange(self._key_stream.meta[0],
+                           device=self.keys.device).repeat_interleave(repeats)
+        self.select_batch(idx)
+
+    def batch_select_indices(self, indices):
+        """Contrastive search: keep only the given batch rows."""
+        if not self.is_initialized:
+            return
+        self.select_batch(indices)
+
+    def select_batch(self, idx):
+        self._key_stream.select_batch(idx)
+        self._value_stream.select_batch(idx)
+        self._rebuild_views()
+
+    def _rebuild_views(self):
+        """Re-materialize the attention-facing views after a structural
+        change (crop / batch gather)."""
+        if not self.is_initialized:
+            return
+        if self._key_stream.seq_len > 0:
+            self.keys = self._key_stream.read()
+            self.values = self._value_stream.read()
+        else:
+            self.keys = torch.empty(0, dtype=self.dtype, device=self.device)
+            self.values = torch.empty(0, dtype=self.dtype, device=self.device)
 
     def reset(self):
         self._key_stream.reset()
