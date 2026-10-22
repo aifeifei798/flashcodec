@@ -60,6 +60,10 @@ GEN = dict(max_new_tokens=NEW, min_new_tokens=NEW, do_sample=False,
 def measure(tag, **patch):
     if patch:
         apply_flash_codec(model, **patch)
+        # warm up after patching: the Triton kernel compiles on first use
+        with torch.no_grad():
+            model.generate(input_ids=ids[:, :256], max_new_tokens=2,
+                           do_sample=False, pad_token_id=tok.eos_token_id)
     if device == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()

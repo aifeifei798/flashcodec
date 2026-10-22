@@ -138,8 +138,13 @@ Read this whole file before making changes.
 - **Decode only** (`Sq == 1`); prefill would blow up the score tensor. png is
   numerically supported but stores r rows per block, so it saves nothing — the
   win is jpeg `k < r`. Remaining peak is the int8→fp32 dequantization of rows.
-- Measured (B=1 H_kv=8 H_q=16 D=64 fp32, 64K): materialized 0.86ms/520MB →
-  coefficient 0.46ms/128MB.
+- Measured (B=1 H_kv=8 H_q=16 D=128, 64K, jpeg k=2 int8): materialized
+  0.89ms/520MB → coefficient-torch 0.43ms/96MB → **coefficient-Triton
+  0.17ms/0MB**. The Triton kernel is `flashcodec/triton_attention.py`
+  (split-K + combine, flash-decoding style); `do_not_specialize` on
+  nb/nr/chunk/ns is required, otherwise every new sequence length recompiles.
+  `impl="auto"` picks Triton on CUDA and falls back to torch for png / CPU /
+  D>256 / no blocks.
 - **HF integration**: `apply_flash_codec(..., materialization_free=True)` wraps
   standard Llama/Qwen-style attention forwards (`patch_attention.py`); guards are
   batch=1 / single-token / eval / no sliding window / standard
@@ -147,11 +152,12 @@ Read this whole file before making changes.
   materializes; the first decode step drops the view (`discard_view()` +
   `layer.keys = None`, otherwise the prefill view stays referenced and no memory
   is saved).
-- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): baseline 53.2 tok/s /
-  peak 581MB; codec k=2 int8 materialized 44.9 tok/s / steady 1535MB; with
-  materialization-free 30.7 tok/s / peak 642MB / steady 122MB. **Memory 12.6×
-  better, decode ~1.7× slower** — it is a sequence of small matmuls, not a fused
-  kernel; a Triton kernel is the open optimization.
+- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): baseline 52.1 tok/s /
+  peak 581MB; codec k=2 int8 materialized 44.2 tok/s / steady 1535MB; with
+  materialization-free (Triton) 40.3 tok/s / peak 642MB / steady 122MB.
+  Per decode step: raw 17.8ms, materialized 21.7ms, Triton 22.8ms — **12.6×
+  less steady memory for ~9% slower decode**. A persistent kernel is the
+  remaining optimization (the per-layer split/combine launch pair).
 - `per_layer={idx: {keep_freqs/quant_bits/...}}` on `from_config` applies a
   calibrated schedule. Measured Qwen3-0.6B: adaptive (cheapest 14 layers at k=4)
   40.83 ppl at 75% storage vs uniform k=6 48.05 at 75% and uniform k=r int8

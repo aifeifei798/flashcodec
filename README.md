@@ -181,10 +181,18 @@ Measured (`benchmarks/bench_attention.py`, B=1, H_kv=8, H_q=16, D=64, fp32):
 | 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
 
 Scope: **decode only** (prefill still uses the view — the coefficient form would
-explode the score tensor), and it is a reference kernel, not yet wired into HF
-attention modules. png stores r rows per block, so it is numerically supported
-but gains nothing; the win is jpeg `k < r` (and int8, whose dequantization is
-the remaining peak).
+explode the score tensor). png stores r rows per block, so it is numerically
+supported but gains nothing; the win is jpeg `k < r`.
+
+A **Triton split-K kernel** (`flashcodec/triton_attention.py`, flash-decoding
+style: block chunks write partial max/sum/acc, a combine kernel merges them)
+removes the intermediate tensors and the launch overhead. One layer, B=1,
+H_kv=8, H_q=16, D=128, `jpeg k=2 int8` (`benchmarks/bench_attention.py --cuda`):
+
+| seq | materialized | coefficient (torch) | coefficient (Triton) |
+|---|---|---|---|
+| 16384 | 0.20ms / 130MB | 0.34ms / 24MB | **0.10ms / 0MB** |
+| 65536 | 0.89ms / 520MB | 0.43ms / 96MB | **0.17ms / 0MB** |
 
 `apply_flash_codec(model, ..., materialization_free=True)` wires it into
 transformers: the forward of standard Llama/Qwen-style attention modules is
@@ -197,13 +205,14 @@ End-to-end (`benchmarks/bench_e2e.py`, Qwen3-0.6B, 4096-token prompt + 32 new):
 
 | tier | tok/s | peak | steady |
 |---|---|---|---|
-| baseline (raw KV) | 53.2 | 581MB | 0MB |
-| codec k=2 int8, materialized | 44.9 | 1545MB | 1535MB |
-| codec k=2 int8, materialization-free | 30.7 | **642MB** | **122MB** |
+| baseline (raw KV) | 52.1 | 581MB | 0MB |
+| codec k=2 int8, materialized | 44.2 | 1545MB | 1535MB |
+| codec k=2 int8, materialization-free (Triton) | 40.3 | **642MB** | **122MB** |
 
-The trade-off is explicit: **12.6× less steady memory** (peak back to baseline)
-for ~1.7× slower decode — the coefficient path is a sequence of small matmuls,
-not a fused attention kernel. That is the next thing to fix (a Triton kernel).
+**12.6× less steady memory** at ~9% slower decode than the materialized path
+(per decode step at 4096 tokens: 22.8ms vs 21.7ms materialized, 17.8ms raw).
+The remaining gap is the per-layer split/combine launch pair; a persistent
+kernel would close it.
 
 ## Demo (side-by-side chat on Qwen3.5-0.8B)
 

@@ -88,6 +88,33 @@ def test_empty_cache_and_prefill_guard():
         pass
 
 
+def test_triton_matches_torch_path():
+    """The Triton split-K kernel must agree with the torch coefficient path
+    (and therefore with the materialized path). CPU-only environments skip."""
+    if not torch.cuda.is_available():
+        print("   (skipped: requires CUDA)")
+        return
+    from flashcodec.cache import _CodecStream, make_codec
+
+    torch.manual_seed(0)
+    B, Hk, D, S = 1, 8, 128, 4096
+    g = 2
+    k = torch.randn(B, Hk, S, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Hk, S, D, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(B, Hk * g, 1, D, device="cuda", dtype=torch.bfloat16)
+    for cfg in (dict(keep_freqs=2, quant_bits=8), dict(keep_freqs=4)):
+        ks = _CodecStream(make_codec("jpeg", block_size=8, **cfg))
+        vs = _CodecStream(make_codec("jpeg", block_size=8, **cfg))
+        ks.append(k)
+        vs.append(v)
+        ref = codec_decode_attention(q, ks, vs, impl="torch")
+        tri = codec_decode_attention(q, ks, vs, impl="triton")
+        d = (ref.float() - tri.float()).abs().max().item()
+        assert d < 2e-3, f"triton vs torch mismatch: {cfg} maxdiff={d:.2e}"
+        auto = codec_decode_attention(q, ks, vs)
+        assert auto.dtype == q.dtype
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

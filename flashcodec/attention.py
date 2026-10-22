@@ -62,7 +62,8 @@ def _stored_rows(stream, dtype=torch.float32):
                       stream._deltas[:, :, :n].float()], dim=-2)
 
 
-def codec_decode_attention(query, key_stream, value_stream, scale=None):
+def codec_decode_attention(query, key_stream, value_stream, scale=None,
+                           impl="auto"):
     """Attention for one new query token against a codec archive, **without**
     materializing the reconstructed KV.
 
@@ -70,6 +71,8 @@ def codec_decode_attention(query, key_stream, value_stream, scale=None):
         query: (B, Hq, 1, D) — the query for the current step.
         key_stream, value_stream: ``_CodecStream`` instances of one layer.
         scale: attention scale (default ``D ** -0.5``).
+        impl: ``"auto"`` (Triton when available and supported, else torch),
+            ``"torch"`` or ``"triton"``.
     Returns:
         (B, Hq, 1, D) attention output, in the query dtype.
 
@@ -85,6 +88,16 @@ def codec_decode_attention(query, key_stream, value_stream, scale=None):
                          f"token (got Sq={Sq}); prefill should use the "
                          "materialized view")
     scale = D ** -0.5 if scale is None else scale
+
+    if impl in ("auto", "triton") and key_stream.codec.name == "jpeg":
+        from .triton_attention import codec_decode_attention_triton
+        out = codec_decode_attention_triton(query, key_stream, value_stream,
+                                            scale=scale)
+        if out is not None:
+            return out
+        if impl == "triton":
+            raise RuntimeError("triton implementation does not support this "
+                               "case (see codec_decode_attention_triton)")
 
     krows = _stored_rows(key_stream, query.dtype)
     vrows = _stored_rows(value_stream, query.dtype)

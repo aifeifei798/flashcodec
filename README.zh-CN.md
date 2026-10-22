@@ -163,9 +163,18 @@ k<r、jpeg int8、png，含 GQA 分组）。`(S, D)` 的重构视图从不出现
 | 65536 | jpeg k=2 int8 | 0.86ms / 520MB | **0.46ms / 128MB** |
 | 65536 | png keep=1.0 | 0.87ms / 520MB | 1.03ms / 272MB |
 
-适用范围：**仅解码**（prefill 仍走物化视图——系数形式会让 score 张量爆炸），
-且目前是参考 kernel，尚未接进 HF 各 attention 模块。png 每块存 r 行，数值上
-支持但省不了内存；收益来自 jpeg `k < r`（以及 int8，剩余峰值主要是反量化）。
+适用范围：**仅解码**（prefill 仍走物化视图——系数形式会让 score 张量爆炸）。
+png 每块存 r 行，数值上支持但省不了内存；收益来自 jpeg `k < r`。
+
+**Triton split-K kernel**（`flashcodec/triton_attention.py`，flash-decoding 式：
+按块分片写 partial max/sum/acc，再由 combine kernel 合并）去掉了中间张量和
+launch 开销。单层、B=1、H_kv=8、H_q=16、D=128、`jpeg k=2 int8`
+（`benchmarks/bench_attention.py --cuda`）：
+
+| seq | 物化 | 系数域（torch） | 系数域（Triton） |
+|---|---|---|---|
+| 16384 | 0.20ms / 130MB | 0.34ms / 24MB | **0.10ms / 0MB** |
+| 65536 | 0.89ms / 520MB | 0.43ms / 96MB | **0.17ms / 0MB** |
 
 `apply_flash_codec(model, ..., materialization_free=True)` 已把它接进
 transformers：包装标准 Llama/Qwen 风格 attention 模块的 forward（投影 + RoPE
@@ -177,13 +186,13 @@ transformers：包装标准 Llama/Qwen 风格 attention 模块的 forward（投�
 
 | 档位 | tok/s | peak | steady |
 |---|---|---|---|
-| baseline（原始 KV） | 53.2 | 581MB | 0MB |
-| codec k=2 int8（物化） | 44.9 | 1545MB | 1535MB |
-| codec k=2 int8（免物化） | 30.7 | **642MB** | **122MB** |
+| baseline（原始 KV） | 52.1 | 581MB | 0MB |
+| codec k=2 int8（物化） | 44.2 | 1545MB | 1535MB |
+| codec k=2 int8（免物化，Triton） | 40.3 | **642MB** | **122MB** |
 
-权衡很明确：**稳态显存降到 1/12.6**（峰值回到 baseline 水平），代价是解码慢
-约 1.7×——系数域是一串小 matmul，不是融合 attention kernel。下一步就是把它写成
-Triton kernel。
+**稳态显存 1/12.6**，解码只比物化路径慢约 9%（4096 token 下每 step：22.8ms vs
+物化 21.7ms，原始 17.8ms）。剩余差距来自逐层的 split/combine 两次 launch，
+persistent kernel 可以再吃掉。
 
 ## Demo（Qwen3.5-0.8B 左右对比 Chat）
 

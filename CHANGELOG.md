@@ -8,6 +8,25 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [0.6.0] — 2026-10-23
+
+### Added
+
+- **Triton split-K kernel for coefficient-domain decode attention**
+  (`flashcodec/triton_attention.py`, flash-decoding style): block chunks write
+  partial (max, sum, acc), a combine kernel merges them. Dequantization, scoring,
+  online softmax and the output accumulation happen in registers, so no
+  intermediate tensors are allocated. One layer at 64K (`jpeg k=2 int8`,
+  B=1, H_kv=8, H_q=16, D=128): materialized 0.89ms/520MB → torch coefficient
+  0.43ms/96MB → **Triton 0.17ms/0MB**.
+- `codec_decode_attention(..., impl="auto"|"torch"|"triton")`; auto picks Triton
+  on CUDA and falls back for png / CPU / D>256 / empty archives.
+  `do_not_specialize` on the dynamic scalars avoids per-step recompilation.
+- End-to-end (Qwen3-0.6B, 4096-token prompt + 32 new): steady KV memory
+  1535MB → 122MB (12.6×) at 40.3 tok/s vs 44.2 materialized (was 30.7 before the
+  kernel); per decode step 22.8ms vs 21.7ms materialized / 17.8ms raw.
+- `tests/test_attention.py` covers Triton-vs-torch agreement and dtype.
+
 ## [0.5.0] — 2026-10-23
 
 ### Added

@@ -103,24 +103,28 @@ for S in (4096, 16384, 65536):
         ref = materialized(ks, vs)()
         t_mat = timed(materialized(ks, vs))
         p_mat, r_mat = mem_mb(materialized(ks, vs))
+        print(f"{S:>6} | {name:<14} | {'materialize':<18} | {t_mat:>7.2f}ms | "
+              f"{p_mat:>6.0f}MB | {r_mat:>7.0f}MB | {'':>9}")
         del ks, vs
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
 
-        ks, vs = build(cfg, k, v)
-        out = codec_decode_attention(q, ks, vs)
-        d = (out - ref).abs().max().item()
-        t_coef = timed(lambda: codec_decode_attention(q, ks, vs))
-        p_coef, r_coef = mem_mb(lambda: codec_decode_attention(q, ks, vs))
-        assert ks._rec is None, "coefficient path must not materialize the view"
-
-        print(f"{S:>6} | {name:<14} | {'materialize':<12} | {t_mat:>7.2f}ms | "
-              f"{p_mat:>6.0f}MB | {r_mat:>7.0f}MB | {d:>9.1e}")
-        print(f"{S:>6} | {name:<14} | {'coefficient':<12} | {t_coef:>7.2f}ms | "
-              f"{p_coef:>6.0f}MB | {r_coef:>7.0f}MB | {'':>9}")
-        del ks, vs
-        if DEVICE == "cuda":
-            torch.cuda.empty_cache()
+        impls = ["torch"] + (["triton"] if DEVICE == "cuda" else [])
+        for impl in impls:
+            ks, vs = build(cfg, k, v)
+            out = codec_decode_attention(q, ks, vs, impl=impl)
+            d = (out - ref).abs().max().item()
+            t_coef = timed(lambda: codec_decode_attention(q, ks, vs, impl=impl))
+            p_coef, r_coef = mem_mb(
+                lambda: codec_decode_attention(q, ks, vs, impl=impl))
+            assert ks._rec is None, \
+                "the coefficient path must not materialize the view"
+            print(f"{S:>6} | {name:<14} | {'coefficient-' + impl:<18} | "
+                  f"{t_coef:>7.2f}ms | {p_coef:>6.0f}MB | {r_coef:>7.0f}MB | "
+                  f"{d:>9.1e}")
+            del ks, vs
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
     print()
 
 print("note: 'materialize' allocates the (S, D) reconstructed view (persisted by\n"
