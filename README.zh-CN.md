@@ -27,16 +27,22 @@
 ```
                     ┌────────────────────────────────────────────┐
   (B,H,S,D) ──append──▶  raw_buffer（未满 r 的尾部，原始高保真）  │
-                    │        │ 满 r 个 token，批量归档（一次 GEMM）│
-                    │        ▼                                    │
-                    │  compressed_storage                         │
-                    │   jpeg: 低频系数 (B,H,n,K,D)                │
-                    │   png:  (deltas (B,H,n,r-1,D), anchor)      │
+                    │        │ 满 r 个 token，批量归档（一次 GEMM， │
+                    │        ▼  原地切片写入）                    │
+                    │  compressed_storage（倍增预分配）            │
+                    │   jpeg: 系数 (B,H,capacity,K,D)             │
+                    │   png:  deltas (B,H,capacity,r-1,D)         │
+                    │        + anchors (B,H,capacity,D)           │
                     └───────────────┬────────────────────────────┘
-                                    │ read()：逐块解压 + raw 尾拼接
+                                    │ read()：有效区单次解码 + raw 尾
                                     ▼
                         重构 KV 视图 (B,H,S,D)
 ```
+
+归档存放在**单块几何倍增缓冲区**里（std::vector 式：初始 16 块，装满翻倍）。
+每满块只做一次原地切片写入（无反复重新分配）；`read()` 对有效区做单次批量
+GEMM / cumsum。若改成逐块碎片归档 + 逐归档循环解压，S=4096 的逐步解码
+read 会因 kernel launch 开销慢约 170×（实测 31ms → 0.18ms）。
 
 ## 因果安全设计
 
@@ -133,10 +139,10 @@ dtype 契约（详见 `AGENTS.md`）：PNG 差分恒为 fp32（bf16 差分会破
 
 | seq | 模式 | storage | 原始比 | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 8.3ms | 2.4ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 28.3ms | 13.0ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 132.6ms | 50.2ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 196.3ms | 82.9ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 15.1ms | 2.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 29.8ms | 13.4ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 103.9ms | 38.7ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 209.5ms | 71.9ms |
 
 PNG 模式不省稠密存储（无损基线的宿命）——它的价值在 30× 方差压缩 + Top-M
 近零稀疏残差，是熵编码器的理想输入（本库不内置熵编码）。

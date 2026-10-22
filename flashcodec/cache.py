@@ -42,22 +42,74 @@ def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0):
 
 
 class _CodecStream:
-    """单条 (B,H,S,D) 流：raw 尾巴 + 压缩归档列表。"""
+    """单条 (B,H,S,D) 流：raw 尾巴 + 倍增预分配的压缩归档。
+
+    归档存储采用 std::vector 式几何倍增预分配（初始 16 块，装满翻倍）：
+    每满块只做一次原地切片写入（无重新分配），read() 对有效区做单次
+    大 GEMM / cumsum——彻底消灭逐归档 Python 循环与碎片 kernel 发射。
+    jpeg: ``_coeffs (B,H,capacity,k,D)``（输入 dtype）；
+    png:  ``_deltas (B,H,capacity,r-1,D)``（fp32）+ ``_anchors (B,H,capacity,D)``。
+    """
+
+    _INITIAL_BLOCKS = 16
 
     def __init__(self, codec):
         self.codec = codec
         self.raw = None          # (B,H,t,D)，t < block_size
-        self.archives = []       # jpeg: coeffs (B,H,n_i,k,D)；png: (delta, anchor)
         self.n_archived = 0      # 已归档 token 总数
+        self.n_blocks = 0        # 归档区已用块数
         self.meta = None         # (B, H, D, elem_size)
         self.dtype = None        # 流输入 dtype（读取统一还原，SDPA dtype 契约）
+        self._capacity = 0       # 归档区已分配块数（几何倍增）
+        self._coeffs = None      # jpeg: (B,H,capacity,k,D)
+        self._deltas = None      # png:  (B,H,capacity,r-1,D) fp32
+        self._anchors = None     # png:  (B,H,capacity,D)
 
     @property
     def block_size(self):
         return self.codec.block_size
 
+    def _grow(self, need_blocks, like):
+        """几何倍增扩容：容量不足时翻倍到 ≥ need_blocks，旧数据原样拷入。"""
+        if need_blocks <= self._capacity:
+            return
+        cap = max(self._INITIAL_BLOCKS, 1)
+        while cap < need_blocks:
+            cap *= 2
+        B, H, D = like.shape[0], like.shape[1], like.shape[-1]
+        if self.codec.name == "jpeg":
+            new = torch.empty((B, H, cap, self.codec.keep_freqs, D),
+                              dtype=self.dtype, device=like.device)
+            if self.n_blocks:
+                new[:, :, :self.n_blocks].copy_(self._coeffs[:, :, :self.n_blocks])
+            self._coeffs = new
+        else:
+            r = self.block_size
+            new_d = torch.empty((B, H, cap, r - 1, D), dtype=torch.float32,
+                                device=like.device)
+            new_a = torch.empty((B, H, cap, D), dtype=self.dtype,
+                                device=like.device)
+            if self.n_blocks:
+                new_d[:, :, :self.n_blocks].copy_(self._deltas[:, :, :self.n_blocks])
+                new_a[:, :, :self.n_blocks].copy_(self._anchors[:, :, :self.n_blocks])
+            self._deltas, self._anchors = new_d, new_a
+        self._capacity = cap
+
+    def _archive(self, head):
+        """把满块 head (..., n_full*r, D) 压缩写入归档区（原地切片）。"""
+        n_full = head.shape[-2] // self.block_size
+        self._grow(self.n_blocks + n_full, head)
+        sl = slice(self.n_blocks, self.n_blocks + n_full)
+        if self.codec.name == "jpeg":
+            self._coeffs[:, :, sl].copy_(self.codec.compress(head))
+        else:
+            delta, anchor = self.codec.filter(head)
+            self._deltas[:, :, sl].copy_(delta)
+            self._anchors[:, :, sl].copy_(anchor)
+        self.n_blocks += n_full
+
     def append(self, tokens):
-        """追加 (B,H,m,D)；满块即批量压缩归档（一次批量 GEMM）。"""
+        """追加 (B,H,m,D)；满块即批量压缩写入归档区（一次批量 GEMM）。"""
         r = self.block_size
         if self.meta is None:
             self.meta = (tokens.shape[0], tokens.shape[1], tokens.shape[-1],
@@ -68,50 +120,48 @@ class _CodecStream:
         total = buf.shape[-2]
         n_full = total // r
         if n_full > 0:
-            head = buf[..., :n_full * r, :]
-            if self.codec.name == "jpeg":
-                self.archives.append(self.codec.compress(head))
-            else:
-                self.archives.append(self.codec.filter(head))
+            self._archive(buf[..., :n_full * r, :])
             self.n_archived += n_full * r
         self.raw = (buf[..., n_full * r:, :].contiguous()
                     if total > n_full * r else None)
 
     def read(self):
-        """重构视图 (B,H,S,D)：逐块解压归档 + raw 尾巴拼接。
+        """重构视图 (B,H,S,D)：有效归档区单次解码 + raw 尾巴拼接。
         统一还原到流输入 dtype（注意力 q/k/v 的 dtype 契约）。"""
-        parts = []
-        for ar in self.archives:
-            if self.codec.name == "jpeg":
-                rec = dct_decompress(ar, self.block_size)
-            else:
-                delta, anchor = ar
-                rec = png_reconstruct(delta, anchor)
-            if self.dtype is not None and rec.dtype != self.dtype:
+        if self.n_blocks == 0:
+            return self.raw
+        if self.codec.name == "jpeg":
+            rec = dct_decompress(self._coeffs[:, :, :self.n_blocks],
+                                 self.block_size)
+            if rec.dtype != self.dtype:
                 rec = rec.to(self.dtype)
-            parts.append(rec)
+        else:
+            rec = png_reconstruct(self._deltas[:, :, :self.n_blocks],
+                                  self._anchors[:, :, :self.n_blocks])
         if self.raw is not None:
-            parts.append(self.raw)
-        return torch.cat(parts, dim=-2) if parts else None
+            rec = torch.cat([rec, self.raw], dim=-2)
+        return rec
 
     def reset(self):
+        """清零内容但保留容量：crop / 重填复用已分配显存，不再反复申请。"""
         self.raw = None
-        self.archives = []
         self.n_archived = 0
+        self.n_blocks = 0
 
     @property
     def seq_len(self):
         return self.n_archived + (0 if self.raw is None else self.raw.shape[-2])
 
     def storage_bytes(self):
+        """逻辑存储（有效区 + raw 尾），不含倍增预留的空闲容量。"""
         total = 0
-        for ar in self.archives:
-            if self.codec.name == "jpeg":
-                total += ar.numel() * ar.element_size()
-            else:
-                delta, anchor = ar
-                total += (delta.numel() * delta.element_size()
-                          + anchor.numel() * anchor.element_size())
+        if self.n_blocks:
+            view = (self._coeffs if self.codec.name == "jpeg"
+                    else self._deltas)
+            total += view[:, :, :self.n_blocks].numel() * view.element_size()
+            if self.codec.name == "png":
+                total += (self._anchors[:, :, :self.n_blocks].numel()
+                          * self._anchors.element_size())
         if self.raw is not None:
             total += self.raw.numel() * self.raw.element_size()
         return total

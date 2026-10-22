@@ -31,15 +31,24 @@ Math (block size `r`, operating axis `dim=-2`):
                     ┌────────────────────────────────────────────┐
   (B,H,S,D) ──append──▶  raw_buffer (tail < r, full fidelity)     │
                     │        │ r tokens accumulated, batched      │
-                    │        ▼ archive (single GEMM)              │
-                    │  compressed_storage                         │
-                    │   jpeg: low-freq coeffs (B,H,n,K,D)         │
-                    │   png:  (deltas (B,H,n,r-1,D), anchor)      │
+                    │        ▼ archive (single GEMM, in-place     │
+                    │             slice write into)               │
+                    │  compressed_storage (capacity-doubled)      │
+                    │   jpeg: coeffs (B,H,capacity,K,D)           │
+                    │   png:  deltas (B,H,capacity,r-1,D)         │
+                    │         + anchors (B,H,capacity,D)          │
                     └───────────────┬────────────────────────────┘
-                                    │ read(): per-block decode + raw tail
+                                    │ read(): one decode of active
+                                    │         region + raw tail
                                     ▼
                         reconstructed KV view (B,H,S,D)
 ```
+
+Archives live in a **single geometrically-grown buffer** (std::vector-style:
+start at 16 blocks, double on overflow). Each full block is one in-place
+slice write — no re-allocation churn — and `read()` is a single batched
+GEMM / cumsum over the active region. (Fragmented per-block archive lists
+made per-token decode ~170× slower at S=4096 due to kernel-launch overhead.)
 
 ## Causal-safety design
 
@@ -142,10 +151,10 @@ requires q/k/v dtype parity).
 
 | seq | Mode | storage | ratio | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 8.3ms | 2.4ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 28.3ms | 13.0ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 132.6ms | 50.2ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 196.3ms | 82.9ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 15.1ms | 2.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 29.8ms | 13.4ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 103.9ms | 38.7ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 209.5ms | 71.9ms |
 
 PNG does not shrink dense storage (the fate of a lossless tier) — its value is
 the 30× variance collapse plus near-zero sparse residuals after Top-M, i.e.

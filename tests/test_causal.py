@@ -39,11 +39,11 @@ def _fill_incr(mode, **kw):
     return cache
 
 
-def _archive_tensors(archives):
-    out = []
-    for ar in archives:
-        out.extend(ar if isinstance(ar, tuple) else (ar,))
-    return out
+def _archive_tensors(st):
+    """归档区有效区快照（倍增预分配存储的逻辑视图）。"""
+    if st.codec.name == "jpeg":
+        return [st._coeffs[:, :, :st.n_blocks]]
+    return [st._deltas[:, :, :st.n_blocks], st._anchors[:, :, :st.n_blocks]]
 
 
 def test_future_perturbation_zero_leak_decode():
@@ -51,7 +51,7 @@ def test_future_perturbation_zero_leak_decode():
     cut = 2 * R                                  # 已归档 2 个整块
     for t in range(cut):
         c.decode_step(k_seq[..., t:t + 1, :], v_seq[..., t:t + 1, :])
-    snap = [[t.clone() for t in _archive_tensors(st.archives)]
+    snap = [[t.clone() for t in _archive_tensors(st)]
             for st in (c._keys[0], c._values[0])]
     view_before = c.key_cache[0].clone()
     pert = torch.randn_like(k_seq[..., cut:, :])
@@ -59,8 +59,12 @@ def test_future_perturbation_zero_leak_decode():
         c.decode_step(pert[..., t - cut:t - cut + 1, :],
                       pert[..., t - cut:t - cut + 1, :])
     for st, snap_i in zip((c._keys[0], c._values[0]), snap):
-        for ar, ar0 in zip(_archive_tensors(st.archives), snap_i):
-            assert torch.equal(ar, ar0), "未来扰动改写了已归档张量"
+        for ar, ar0 in zip(_archive_tensors(st), snap_i):
+            # 归档区是倍增预分配的连续存储：有效区只增不改，
+            # 已快照的历史前缀必须逐位不变
+            n0 = ar0.shape[2]
+            assert torch.equal(ar[:, :, :n0], ar0), \
+                "未来扰动改写了已归档张量"
     assert torch.equal(c.key_cache[0][..., :cut, :], view_before[..., :cut, :]), \
         "未来扰动改写了历史视图"
 
@@ -73,9 +77,10 @@ def test_future_perturbation_zero_leak_forward():
     k2[..., cut:, :] = torch.randn_like(k2[..., cut:, :])
     c1.forward(k_seq, v_seq)
     c2.forward(k2, v_seq)
-    # 全量模式下所有完整块在一次 append 中批量归档为单个 chunk
+    # 全量模式下所有完整块一次归档进倍增存储
     # (B,H,n_blocks,k,D)；块维在 -3
-    a1, a2 = c1._keys[0].archives[0], c2._keys[0].archives[0]
+    s1, s2 = c1._keys[0], c2._keys[0]
+    a1, a2 = _archive_tensors(s1)[0], _archive_tensors(s2)[0]
     assert torch.equal(a1[..., :3, :, :], a2[..., :3, :, :]), \
         "全量模式下未来扰动影响了历史归档"
     assert torch.equal(c1.key_cache[0][..., :cut, :],
