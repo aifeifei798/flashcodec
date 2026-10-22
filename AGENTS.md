@@ -34,6 +34,23 @@
 - `crop`（投机解码路径）：从裁剪后视图重建归档（原型语义）；
   `offload/prefetch` 为 no-op；beam search（reorder_cache）不支持。
 
+## dtype 契约（Qwen3.5-0.8B 实战踩坑总结，改 codecs 前必读）
+
+- **PNG deltas 恒为 fp32**：bf16 输入的差分在 bf16 里算会掉 ~0.4% 精度，
+  cumsum 重建不再逐位精确（bf16 差分在 fp32 中精确可表示，anchor+ΣΔ
+  可逐位还原原值）——这是"无损 → 生成 token 与基线逐位一致"的根据。
+  bf16 部署下归档约 1.9× dense（带宽换精确）。
+- **JPEG coeffs 存输入 dtype**（fp32 计算后 cast）：有损档无需更高精度，
+  且存储比不虚高（k=2 实测 ~27% raw）。
+- **`_CodecStream.read()` 统一还原流输入 dtype**：SDPA 要求 q/k/v 同
+  dtype，fp32 视图喂给 bf16 模型会直接崩。
+- 混合架构（Qwen3.5：18 linear_attention + 6 full_attention）：必须用
+  `FlashCodecCache.from_config(model.config)` 按 layer_types 只给
+  full_attention 层挂 codec，其余层保留原生动态层（递归状态等接口
+  不受影响）；`apply_flash_codec` 已自动走 from_config。
+- 实战脚本：`benchmarks/run_qwen_demo.py`（PNG 无损逐位一致断言 +
+  JPEG 存储比/流畅度报告 + 混合层审计）。
+
 ## 张量契约（改动任何签名前必读）
 
 - KV 布局 `(B, H, S, D)`；**压缩/滤波操作轴恒为 dim=-2（seq 轴）**。

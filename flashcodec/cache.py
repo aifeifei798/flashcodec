@@ -50,6 +50,7 @@ class _CodecStream:
         self.archives = []       # jpeg: coeffs (B,H,n_i,k,D)；png: (delta, anchor)
         self.n_archived = 0      # 已归档 token 总数
         self.meta = None         # (B, H, D, elem_size)
+        self.dtype = None        # 流输入 dtype（读取统一还原，SDPA dtype 契约）
 
     @property
     def block_size(self):
@@ -61,6 +62,7 @@ class _CodecStream:
         if self.meta is None:
             self.meta = (tokens.shape[0], tokens.shape[1], tokens.shape[-1],
                          tokens.element_size())
+            self.dtype = tokens.dtype        # 归档/读取统一回输入 dtype
         buf = tokens if self.raw is None else torch.cat(
             [self.raw, tokens], dim=-2)
         total = buf.shape[-2]
@@ -76,14 +78,18 @@ class _CodecStream:
                     if total > n_full * r else None)
 
     def read(self):
-        """重构视图 (B,H,S,D)：逐块解压归档 + raw 尾巴拼接。"""
+        """重构视图 (B,H,S,D)：逐块解压归档 + raw 尾巴拼接。
+        统一还原到流输入 dtype（注意力 q/k/v 的 dtype 契约）。"""
         parts = []
         for ar in self.archives:
             if self.codec.name == "jpeg":
-                parts.append(dct_decompress(ar, self.block_size))
+                rec = dct_decompress(ar, self.block_size)
             else:
                 delta, anchor = ar
-                parts.append(png_reconstruct(delta, anchor))
+                rec = png_reconstruct(delta, anchor)
+            if self.dtype is not None and rec.dtype != self.dtype:
+                rec = rec.to(self.dtype)
+            parts.append(rec)
         if self.raw is not None:
             parts.append(self.raw)
         return torch.cat(parts, dim=-2) if parts else None
@@ -311,6 +317,44 @@ class FlashCodecCache(_HFCache):
         """旧版 transformers 习惯的计数器属性（5.x 内部已不用，保留兼容）。"""
         return self.get_seq_length()
 
+    @classmethod
+    def from_config(cls, config, mode="jpeg", block_size=8, keep_freqs=2,
+                    keep_ratio=1.0):
+        """按模型 config 构建混合层列表（Qwen3.5 等混合架构）：
+        只有 full_attention 层挂 codec 层，其余层类型（linear_attention/
+        sliding 等）保留原生动态层——与 DynamicCache(config=...) 的分发
+        一致，线性注意力的递归状态等原生接口不受影响。"""
+        from transformers.cache_utils import (DYNAMIC_LAYER_TYPE_MAPPING,
+                                              get_layer_types_and_kwargs)
+        decoder = (config.get_text_config(decoder=True)
+                   if hasattr(config, "get_text_config") else config)
+        try:
+            layer_types, per_layer_kwargs = get_layer_types_and_kwargs(decoder)
+        except Exception:                        # 老式 config 无 per_layer_config
+            layer_types = list(getattr(decoder, "layer_types",
+                                       ["full_attention"] *
+                                       getattr(decoder, "num_hidden_layers", 1)))
+            per_layer_kwargs = [{} for _ in layer_types]
+        layers = []
+        for ltype, lkw in zip(layer_types, per_layer_kwargs):
+            if ltype == "full_attention":
+                layers.append(FlashCodecLayer(
+                    mode=mode, block_size=block_size, keep_freqs=keep_freqs,
+                    keep_ratio=keep_ratio))
+            else:
+                layers.append(DYNAMIC_LAYER_TYPE_MAPPING[ltype](**lkw))
+        obj = cls.__new__(cls)
+        _HFCache.__init__(obj, layers=layers, layer_class_to_replicate=None)
+        obj.mode = mode
+        obj.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
+                             keep_ratio=keep_ratio)
+        return obj
+
+    def codec_layer_indices(self):
+        """真正挂了编解码的层下标（混合架构中即 full_attention 层）。"""
+        return [i for i, layer in enumerate(self.layers)
+                if isinstance(layer, FlashCodecLayer)]
+
     def to_legacy_cache(self):
         """导出为 {layer_idx: (keys, values)} 旧格式（重构后的完整视图）。"""
         return {i: (layer.keys, layer.values)
@@ -329,4 +373,4 @@ class FlashCodecCache(_HFCache):
         layers = (self.layers if layer_idx is None
                   else [self.layers[layer_idx]])
         return sum(layer.storage_bytes() for layer in layers
-                   if getattr(layer, "is_initialized", False))
+                   if isinstance(layer, FlashCodecLayer))

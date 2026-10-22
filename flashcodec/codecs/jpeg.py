@@ -46,14 +46,15 @@ def _pad_to_blocks(x, r):
 
 
 def dct_compress(x, r, k):
-    """分块 DCT 投影：x (..., S, D) -> coeffs (..., n_blocks, k, D)。
-    seq 轴按 r 分块（尾部零填充），每块沿块内轴投影到前 k 个 DCT-II 基底。
-    压缩存储比 = r/k（外加尾部 padding 开销）。"""
+    """分块 DCT 投影：x (..., S, D) -> coeffs (..., n_blocks, k, D)（x dtype）。
+    seq 轴按 r 分块（尾部零填充），每块沿块内轴投影到前 k 个 DCT-II 基底
+    （fp32 计算后还原输入 dtype——有损档无需更高精度，且存储比不虚高）。
+    压缩存储比 = k/r（同 dtype，外加尾部 padding 开销）。"""
     blocks, _ = _pad_to_blocks(x, r)
     basis = dct_basis(r, k, device=x.device, dtype=torch.float32)
     hp = blocks.float().transpose(-2, -1)              # (..., n, D, r)
     coef = torch.matmul(hp, basis.t())                 # (..., n, D, k)
-    return coef.transpose(-2, -1)                      # (..., n, k, D)
+    return coef.transpose(-2, -1).to(x.dtype)          # (..., n, k, D)
 
 
 def dct_decompress(coeffs, r, out_len=None):

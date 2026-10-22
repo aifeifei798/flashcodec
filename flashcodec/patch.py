@@ -28,19 +28,26 @@ def find_attention_modules(model):
             if hasattr(m, "k_proj") and hasattr(m, "v_proj")]
 
 
-def _make_factory(mode, block_size, kwargs, sink):
+def _make_factory(mode, block_size, kwargs, sink, config=None):
+    codec_kw = dict(keep_freqs=kwargs.get("keep_freqs", 2),
+                    keep_ratio=kwargs.get("keep_ratio", 1.0))
     if HAS_HF_CACHE:
         def factory():
-            c = FlashCodecCache(mode=mode, block_size=block_size,
-                                keep_freqs=kwargs.get("keep_freqs", 2),
-                                keep_ratio=kwargs.get("keep_ratio", 1.0))
+            c = None
+            if config is not None:              # 混合架构（如 Qwen3.5）按
+                try:                            # layer_types 只给全注意力层挂 codec
+                    c = FlashCodecCache.from_config(
+                        config, mode=mode, block_size=block_size, **codec_kw)
+                except Exception:
+                    c = None
+            if c is None:
+                c = FlashCodecCache(mode=mode, block_size=block_size,
+                                    **codec_kw)
             sink.append(c)
             return c
     else:                                       # 无 transformers 的保底
         def factory():
-            c = CodecKVCache(mode=mode, block_size=block_size,
-                             keep_freqs=kwargs.get("keep_freqs", 2),
-                             keep_ratio=kwargs.get("keep_ratio", 1.0))
+            c = CodecKVCache(mode=mode, block_size=block_size, **codec_kw)
             sink.append(c)
             return c
     return factory
@@ -60,7 +67,8 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
 
     attns = find_attention_modules(model)
     caches = []                                 # 供测试/诊断检查实际注入的缓存
-    factory = _make_factory(mode, block_size, kwargs, caches)
+    factory = _make_factory(mode, block_size, kwargs, caches,
+                            config=getattr(model, "config", None))
 
     base_generate = model.generate
     base_forward = model.forward

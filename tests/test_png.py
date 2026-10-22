@@ -28,6 +28,16 @@ def test_lossless_bitwise_baseline():
     assert d < 1e-6, f"keep_ratio=1.0 应逐位无损, maxdiff={d:.2e}"
 
 
+def test_lossless_bitwise_on_bf16():
+    """bf16 输入（真实模型部署精度）：无损档位必须逐位精确还原。
+    deltas 以 fp32 计算/存储是该保证的 dtype 契约。"""
+    xb = torch.randn(B, H, S, D).to(torch.bfloat16)
+    rec, delta, anchor = _roundtrip(xb, 1.0)
+    assert delta.dtype == torch.float32, "deltas 必须是 fp32（无损精度契约）"
+    assert torch.equal(rec, xb), \
+        f"bf16 无损重建应逐位相等, maxdiff={(rec.float()-xb.float()).abs().max():.2e}"
+
+
 def test_variance_collapse():
     var_x = smooth.var().item()
     var_d = (smooth[..., 1:, :] - smooth[..., :-1, :]).var().item()
