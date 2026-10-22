@@ -18,7 +18,8 @@ never hit this path); `codec_attention_stats` reports how many layers are wrappe
 """
 
 import importlib
-import types
+
+import torch
 
 from .attention import codec_decode_attention
 from .cache import FlashCodecLayer
@@ -61,7 +62,17 @@ def _attention_forward(module, orig, hidden_states,
 
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, module.head_dim)
-    q = module.q_proj(hidden_states).view(hidden_shape)
+    o_in = module.o_proj.in_features
+    gated = module.q_proj.out_features == 2 * o_in      # Qwen3.5-style Q gate
+    q_raw = module.q_proj(hidden_states)
+    gate = None
+    if gated:
+        q, gate = torch.chunk(
+            q_raw.view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+        gate = gate.reshape(*input_shape, -1)
+    else:
+        q = q_raw
+    q = q.view(hidden_shape)
     k = module.k_proj(hidden_states).view(hidden_shape)
     v = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     # Qwen3-style QK-norm is applied on (heads, head_dim) before the transpose
@@ -86,6 +97,8 @@ def _attention_forward(module, orig, hidden_states,
     out = codec_decode_attention(q, layer._key_stream, layer._value_stream,
                                  scale=module.scaling)
     out = out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+    if gated:
+        out = out * torch.sigmoid(gate)
     return module.o_proj(out), None
 
 
@@ -98,6 +111,13 @@ def apply_codec_attention(model):
         if not (hasattr(module, "q_proj") and hasattr(module, "k_proj")
                 and hasattr(module, "v_proj") and hasattr(module, "o_proj")
                 and hasattr(module, "layer_idx") and hasattr(module, "head_dim")):
+            continue
+        # only the standard layout: head_dim divides the output width, and the
+        # query projection is either plain (Llama/Qwen3) or gated (Qwen3.5)
+        o_in = module.o_proj.in_features
+        if module.head_dim <= 0 or o_in % module.head_dim:
+            continue
+        if module.q_proj.out_features not in (o_in, 2 * o_in):
             continue
         if getattr(module, "_flashcodec_orig_forward", None) is not None:
             wrapped += 1

@@ -218,9 +218,16 @@ kernel would close it.
 
 ![flashcodec side-by-side Gradio demo](images/demo.png)
 
-Same prompt, two panels: native KV cache on the left, flashcodec on the
-right (mode switchable: png lossless / jpeg k=1,2,4), with a bar chart of
-storage & latency savings and a token-match table underneath.
+Same prompt, two panels: native KV cache on the left, flashcodec on the right
+(five tiers: png lossless / jpeg k=8 int8 / k=4 / k=2 / k=2 int8), with a
+materialization-free toggle (coefficient-domain + Triton) and per-turn stats:
+KV footprint (archive vs materialized view), peak/steady memory, per-token
+latency and token match.
+
+The **Full comparison** tab runs the baseline plus every tier on one prompt and
+reports, per tier: KV footprint vs raw, archive/view split, decode tok/s,
+peak/steady memory, teacher-forced NLL of the continuation (a perplexity-style
+quality number) and token match — plus storage / speed / NLL bars.
 
 ```bash
 pip install -e ".[demo]"   # gradio + matplotlib

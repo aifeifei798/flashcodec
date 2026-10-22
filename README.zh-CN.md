@@ -198,9 +198,14 @@ persistent kernel 可以再吃掉。
 
 ![flashcodec Gradio 左右对比 demo](images/demo.png)
 
-同一 prompt 两栏并排：左侧原生 KV Cache，右侧 flashcodec（档位可切：
-png 无损 / jpeg k=1,2,4），底部柱状图对比存储与耗时的节约，并附 token
-一致率表。
+同一 prompt 两栏并排：左侧原生 KV Cache，右侧 flashcodec（五档：png 无损 /
+jpeg k=8 int8 / k=4 / k=2 / k=2 int8），带「免物化解码」开关（系数域 +
+Triton），每轮统计 KV 占用（归档 vs 物化视图）、峰值/稳态显存、每 token 延迟
+与 token 一致率。
+
+**Full comparison** 标签页会在同一 prompt 上跑 baseline + 所有档位，逐档给出：
+KV 占用对比原始、归档/视图拆分、decode tok/s、峰值/稳态显存、续写部分的
+teacher-forced NLL（困惑度式质量指标）与 token 一致率，并画存储/速度/NLL 三张柱状图。
 
 ```bash
 pip install -e ".[demo]"   # gradio + matplotlib

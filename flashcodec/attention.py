@@ -26,7 +26,6 @@ handled by the standard path. Prefill still goes through the materialized view â
 the coefficient-domain form would blow up the score tensor there.
 """
 
-import math
 
 import torch
 
