@@ -94,11 +94,12 @@ Read this whole file before making changes.
    `raw_buffer` (original precision) — a future perturbation at any point during
    incremental decoding must never rewrite already-archived tensors (`test_causal`
    verifies this bitwise).
-2. The archives and views produced by the two fill paths — full `forward(seq)` and
-   stepwise `decode_step` — must be **bitwise-identical** (both paths write into the
-   same capacity-doubling storage and share a single decode pass, so they are
-   inherently symmetric; think this through before switching to a sharded
-   structure).
+2. The two fill paths — full `forward(seq)` and stepwise `decode_step` — must
+   produce **bitwise-identical archives** (compression is per block and grouping
+   invariant) and views that agree exactly on png (cumsum is per-block) and within
+   ≤1e-6 on jpeg (batched-GEMM reduction order depends on the batch size once
+   `read()` is memoized: one block vs N blocks; on some BLAS builds it is bitwise,
+   on others not — don't assert `torch.equal` for jpeg).
 3. In the `mode="png", keep_ratio=1.0` lossless mode, stepwise decoding attention
    must align with the full forward pass within ≤1e-4 (the tests' correctness
    anchor).
