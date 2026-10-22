@@ -59,18 +59,32 @@ pip install -e .        # dependency: torch>=2.0
 
 ```python
 import torch
-from flashcodec import CodecKVCache, apply_flash_codec
+from flashcodec import FlashCodecCache, apply_flash_codec
 
-# 1) Use the cache manager directly (dual interface)
-cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)   # 4× compression
-k, v = cache.forward(k_seq, v_seq)          # full-sequence: block-parallel fill
-k, v = cache.decode_step(new_k, new_v)      # incremental: archives across borders
-print(cache.stats(0))                       # tokens / archived / storage_bytes
+# 1) Native: a first-class transformers 5.x Cache backend (any CausalLM)
+cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)  # 4×
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+print(cache.get_seq_length(), cache.storage_bytes())
 
-# 2) One-line hot patch for HuggingFace causal LMs (standard Cache API)
+# 2) One-line hot patch: every generate() defaults to the codec cache
 apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
-out = model.generate(**inputs, use_cache=True)   # KV flows through the codec cache
+out = model.generate(input_ids, max_new_tokens=64)
+# PNG lossless tier reproduces the unpatched model's tokens EXACTLY
+from flashcodec import remove_flash_codec
+remove_flash_codec(model)          # restore default behavior
+
+# 3) Standalone (no transformers needed): direct cache manager
+from flashcodec import CodecKVCache
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
+k, v = cache.forward(k_seq, v_seq)          # full-sequence fill
+k, v = cache.decode_step(new_k, new_v)      # incremental decode
 ```
+
+`FlashCodecCache` subclasses `transformers.cache_utils.Cache` (5.x layer
+API): write/read replacement is converged at the `cache.update(k, v,
+layer_idx)` interface — zero model surgery, works with any CausalLM
+(Llama/Qwen/Mistral-style GQA included).
 
 ## Benchmarks (measured; B=2 H=8 S=2048 D=64, random-walk autocorrelated signal, fp32)
 
@@ -116,9 +130,11 @@ flashcodec/
 ## Tests
 
 ```bash
-python tests/test_jpeg.py     # orthonormality, k=r lossless, k=2 cosine>0.99, K monotone
-python tests/test_png.py      # lossless maxdiff<1e-6, variance ratio printed, differentiable
-python tests/test_causal.py   # zero future leakage, incremental vs full ≤1e-4
+python tests/test_jpeg.py           # orthonormality, k=r lossless, k=2 cosine>0.99, K monotone
+python tests/test_png.py            # lossless maxdiff<1e-6, variance ratio printed, differentiable
+python tests/test_causal.py         # zero future leakage, incremental vs full ≤1e-4
+python tests/test_hf_integration.py # native transformers 5.x generate: explicit cache / hot patch /
+                                    # PNG lossless exact tokens / 70-token multi-block stability
 ```
 
 ## Boundaries (honest list)

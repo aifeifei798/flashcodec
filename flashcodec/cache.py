@@ -20,6 +20,17 @@ import torch
 
 from .codecs import JPEGCodec, PNGCodec, dct_decompress, png_reconstruct
 
+try:  # transformers 5.x 原生 Cache 生态（layer 容器模式）
+    from functools import partial
+
+    from transformers.cache_utils import Cache as _HFCache
+    from transformers.cache_utils import DynamicLayer as _HFDynamicLayer
+    HAS_HF_CACHE = True
+except Exception:                                    # 未安装 transformers 时保底
+    _HFCache = object
+    _HFDynamicLayer = object
+    HAS_HF_CACHE = False
+
 
 def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0):
     """按模式名构造编解码器实例。"""
@@ -196,3 +207,126 @@ class CodecKVCache:
     def __repr__(self):
         return (f"CodecKVCache(mode={self.mode!r}, codec={self.codec}, "
                 f"layers={sorted(set(self._keys) | set(self._values))})")
+
+
+# ============================================================
+# transformers 5.x 原生 Cache 后端（layer 容器模式）
+# ============================================================
+class FlashCodecLayer(_HFDynamicLayer):
+    """transformers 5.x CacheLayer：把 DynamicLayer 的 cat 式增长替换为
+    编解码流（raw 尾 + 满块归档）。update 返回重构后的完整因果可见 KV，
+    供注意力层直接使用——写入与读取的替换收敛在这一层，模型零手术。"""
+
+    def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
+                 keep_ratio=1.0):
+        super().__init__()
+        codec = make_codec(mode, block_size, keep_freqs, keep_ratio)
+        self.mode = mode
+        self.codec = codec
+        self._key_stream = _CodecStream(codec)
+        self._value_stream = _CodecStream(codec)
+
+    def lazy_initialization(self, key_states, value_states):
+        self.dtype, self.device = key_states.dtype, key_states.device
+        self.keys = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.values = torch.tensor([], dtype=self.dtype, device=self.device)
+        self.is_initialized = True
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        if not self.is_initialized:
+            self.lazy_initialization(key_states, value_states)
+        self._key_stream.append(key_states)
+        self._value_stream.append(value_states)
+        self.keys = self._key_stream.read()
+        self.values = self._value_stream.read()
+        return self.keys, self.values
+
+    def get_seq_length(self):
+        return self._key_stream.seq_len
+
+    def get_max_length(self):
+        return -1                            # 动态缓存无上限
+
+    def crop(self, tokens_to_remove):
+        """投机解码等路径会裁剪缓存：从裁剪后的重构视图重建归档
+ （原型语义：重建会把已压缩部分重新过滤一遍）。"""
+        if tokens_to_remove > 0:
+            raise ValueError("crop 只支持负值（移除末尾 token）")
+        if tokens_to_remove == 0:
+            return
+        self._key_stream.reset()
+        self._value_stream.reset()
+        self.keys = self.keys[..., :tokens_to_remove, :]
+        self.values = self.values[..., :tokens_to_remove, :]
+        if self.keys.shape[-2] > 0:
+            self._key_stream.append(self.keys)
+            self._value_stream.append(self.values)
+
+    def reset(self):
+        self._key_stream.reset()
+        self._value_stream.reset()
+        super().reset()
+
+    def offload(self):
+        pass                               # 原型不支持层卸载（流式归档在 CPU 外）
+
+    def prefetch(self):
+        pass
+
+    def storage_bytes(self):
+        return (self._key_stream.storage_bytes()
+                + self._value_stream.storage_bytes())
+
+
+class FlashCodecCache(_HFCache):
+    """transformers 5.x 原生编解码 KV Cache（第一等公民后端）。
+
+    用法一（显式传参）::
+
+        cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)
+        model.generate(input_ids, past_key_values=cache, use_cache=True)
+
+    用法二（apply_flash_codec 热补丁自动注入）。
+    基类 Cache 以 layer_class_to_replicate 懒建层，update 直接下发到
+    FlashCodecLayer；get_seq_length / get_max_length / crop 等继承即用。
+    """
+
+    def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
+                 keep_ratio=1.0):
+        if not HAS_HF_CACHE:
+            raise ImportError(
+                "FlashCodecCache 需要 transformers 5.x（本项目仅适配当前安装的 "
+                "5.20 Cache 生态）；无 transformers 时请使用 CodecKVCache。")
+        super().__init__(
+            layers=None,
+            layer_class_to_replicate=partial(
+                FlashCodecLayer, mode=mode, block_size=block_size,
+                keep_freqs=keep_freqs, keep_ratio=keep_ratio))
+        self.mode = mode
+        self.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
+                              keep_ratio=keep_ratio)
+
+    @property
+    def _seen_tokens(self):
+        """旧版 transformers 习惯的计数器属性（5.x 内部已不用，保留兼容）。"""
+        return self.get_seq_length()
+
+    def to_legacy_cache(self):
+        """导出为 {layer_idx: (keys, values)} 旧格式（重构后的完整视图）。"""
+        return {i: (layer.keys, layer.values)
+                for i, layer in enumerate(self.layers)}
+
+    @classmethod
+    def from_legacy_cache(cls, legacy, **cfg):
+        """从旧格式 {(layer_idx): (k, v)} 重建（整段重走过一遍编解码）。"""
+        cache = cls(**cfg)
+        for layer_idx in sorted(legacy):
+            k, v = legacy[layer_idx]
+            cache.update(k, v, layer_idx)
+        return cache
+
+    def storage_bytes(self, layer_idx=None):
+        layers = (self.layers if layer_idx is None
+                  else [self.layers[layer_idx]])
+        return sum(layer.storage_bytes() for layer in layers
+                   if getattr(layer, "is_initialized", False))

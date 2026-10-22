@@ -7,16 +7,20 @@
 张量契约：KV 布局 (B, H, S, D)，压缩轴 dim=-2（seq 轴）。
 """
 
-from .cache import CodecKVCache, make_codec
+from .cache import HAS_HF_CACHE, CodecKVCache, FlashCodecCache, \
+    FlashCodecLayer, make_codec
 from .codecs import JPEGCodec, PNGCodec, dct_basis, dct_compress, \
     dct_decompress, png_filter, png_reconstruct
-from .patch import apply_flash_codec, find_attention_modules, undo_flash_codec
+from .patch import apply_flash_codec, find_attention_modules, \
+    remove_flash_codec, undo_flash_codec
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "apply_flash_codec", "undo_flash_codec", "find_attention_modules",
-    "CodecKVCache", "make_codec", "JPEGCodec", "PNGCodec",
+    "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",
+    "find_attention_modules",
+    "CodecKVCache", "FlashCodecCache", "FlashCodecLayer", "make_codec",
+    "HAS_HF_CACHE", "JPEGCodec", "PNGCodec",
     "dct_basis", "dct_compress", "dct_decompress",
     "png_filter", "png_reconstruct",
     "__version__",

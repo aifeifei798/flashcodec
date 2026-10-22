@@ -11,10 +11,28 @@
   同名布局的固有陷阱。`pip install -e .` 后任意位置可导入。
 - 测试是直跑脚本（`assert` + `__main__` 汇总，函数名兼容 pytest）：
   `python tests/test_jpeg.py`、`python tests/test_png.py`、
-  `python tests/test_causal.py`。改 codecs/cache 后三组全跑。
+  `python tests/test_causal.py`、`python tests/test_hf_integration.py`。
+  改 codecs/cache 后四组全跑。
 - 基准：`python benchmarks/bench_reconstruct.py`（PSNR/余弦）、
   `python benchmarks/bench_vram.py [--cuda]`（存储占用/耗时）。
 - 本目录在宿主仓库里被 gitignore——独立 git 仓库，独立发版。
+
+## transformers 集成（只适配本机 5.20，4.x 明确不支持）
+
+- `FlashCodecLayer(DynamicLayer)` + `FlashCodecCache(Cache,
+  layer_class_to_replicate=partial(...))`：5.x 的 Cache 是 layer 容器，
+  基类 `update` 懒建层并下发到 layer；**5.x 注意力直接消费 `update` 的
+  返回值**（不是读 `key_cache`），所以 layer.update 必须返回重构后的
+  完整因果可见 KV。
+- `apply_flash_codec` 主钩子是 `model.generate`（5.x generate 内部自建
+  DynamicCache，只在入口注入才生效）；forward 包装为辅。
+- 生成语义：**cache 长度 = prompt + new_tokens - 1**——末位生成 token 的
+  KV 从不被计算（无人 attend），断言别写成总长。
+- 集成测试陷阱：随机初始化的微模型会误吐 eos 提前停止
+  （`generation_config.eos_token_id = None` 关掉）；lm_head ×20 放大制造
+  明确 argmax 间隔，隔离平局抖动、专注检验缓存机制。
+- `crop`（投机解码路径）：从裁剪后视图重建归档（原型语义）；
+  `offload/prefetch` 为 no-op；beam search（reorder_cache）不支持。
 
 ## 张量契约（改动任何签名前必读）
 

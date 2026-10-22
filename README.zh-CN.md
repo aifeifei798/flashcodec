@@ -54,18 +54,31 @@ pip install -e .        # 依赖：torch>=2.0
 
 ```python
 import torch
-from flashcodec import CodecKVCache, apply_flash_codec
+from flashcodec import FlashCodecCache, apply_flash_codec
 
-# 1) 直接用缓存管理器（双接口）
-cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)   # 4× 压缩
-k, v = cache.forward(k_seq, v_seq)          # 全量前向：分块平铺一次算完
-k, v = cache.decode_step(new_k, new_v)      # 增量解码：跨块边界自动归档
-print(cache.stats(0))                       # tokens / archived / storage_bytes
+# 1) 原生：transformers 5.x 一等公民 Cache 后端（任意 CausalLM）
+cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)  # 4×
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+print(cache.get_seq_length(), cache.storage_bytes())
 
-# 2) 一行热补丁注入 HuggingFace 因果 LM（走标准 Cache 接口）
+# 2) 一行热补丁：之后每次 generate() 默认走编解码缓存
 apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
-out = model.generate(**inputs, use_cache=True)   # KV 自动走编解码缓存
+out = model.generate(input_ids, max_new_tokens=64)
+# PNG 无损档位与未打补丁模型的生成 token 逐位完全一致
+from flashcodec import remove_flash_codec
+remove_flash_codec(model)          # 随时还原默认行为
+
+# 3) 独立使用（无需 transformers）：直接操作缓存管理器
+from flashcodec import CodecKVCache
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
+k, v = cache.forward(k_seq, v_seq)          # 全量前向填充
+k, v = cache.decode_step(new_k, new_v)      # 增量解码
 ```
+
+`FlashCodecCache` 继承 `transformers.cache_utils.Cache`（5.x layer API）：
+KV 写入与读取的替换收敛在 `cache.update(k, v, layer_idx)` 接口——零模型
+手术，任意 CausalLM（含 Llama/Qwen/Mistral 风格 GQA）通用。
 
 ## 基准（实测，B=2 H=8 S=2048 D=64，随机游走自相关信号，fp32）
 
@@ -110,9 +123,12 @@ flashcodec/
 ## 测试
 
 ```bash
-python tests/test_jpeg.py     # 正交归一、K=r 无损、k=2 余弦>0.99、K 单调
-python tests/test_png.py      # 无损 maxdiff<1e-6、方差压缩比打印、可微
-python tests/test_causal.py   # 未来扰动零泄露、增量 vs 全量 ≤1e-4
+python tests/test_jpeg.py           # 正交归一、K=r 无损、k=2 余弦>0.99、K 单调
+python tests/test_png.py            # 无损 maxdiff<1e-6、方差压缩比打印、可微
+python tests/test_causal.py         # 未来扰动零泄露、增量 vs 全量 ≤1e-4
+python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
+                                    # 显式缓存 / 热补丁 / PNG 无损逐 token 一致 /
+                                    # 70 token 跨 8+ 块稳定性
 ```
 
 ## 边界与说明（诚实清单）
