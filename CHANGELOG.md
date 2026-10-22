@@ -8,6 +8,24 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [0.6.1] — 2026-10-23
+
+### Fixed
+
+- **`materialization_free=True` on Qwen3.5**: its attention uses a Q-gate
+  (`q_proj` emits query + gate, and the attention output is scaled by
+  `sigmoid(gate)` before `o_proj`). The wrapper now handles that layout and
+  guards on `head_dim` / `o_proj` width, falling back to the original forward for
+  anything that does not match (no more shape errors on hybrid models).
+
+### Changed
+
+- Demo comparison is much more detailed: five tiers (png lossless, jpeg k=8
+  int8, k=4, k=2, k=2 int8), a materialization-free toggle, and a "Full
+  comparison" tab that reports per tier — KV footprint vs raw, archive/view
+  split, decode tok/s, peak/steady memory, continuation NLL (perplexity-style)
+  and token match, with storage/speed/NLL bars.
+
 ## [0.6.0] — 2026-10-23
 
 ### Added
