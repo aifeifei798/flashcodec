@@ -7,14 +7,20 @@
 Conventional LLM research treats hidden-space tensors as isolated scalar
 factors. flashcodec observes that the seq axis of a `(B, H, S, D)` KV tensor
 behaves like the rows/columns of a high-dimensional image — adjacent token
-representations are strongly autocorrelated, energy concentrates in low
-frequencies, and first-order differences collapse in variance. Two classic
+representations are autocorrelated, energy concentrates in low frequencies, and
+first-order differences shrink in variance (how strongly depends on the model,
+layer and tensor: the measured real-KV statistics and the per-layer caveat are
+in the Benchmarks section). Two classic
 multimedia compression theories therefore transfer directly:
 
 | Mode | Inspired by | Transform | Nature | Storage |
 |---|---|---|---|---|
 | `mode="jpeg"` | JPEG | Block-wise orthonormal 1D DCT-II, keep lowest K coeffs | **Lossy, frequency domain** | `K/r` (4×–8× less memory) |
 | `mode="png"` | PNG | Per-block anchor (I-Token) + first-order deltas, Top-M pruning | **Lossless / near-lossless, time domain** | Dense, size-neutral; sparsity left to entropy coding |
+
+`quant_bits=8` (jpeg only) stores the coefficients as int8 with a
+per-(block, frequency) scale — a real byte-level saving on top of `K/r`:
+**6.6% of raw KV at k=2 (15×), 46.9 dB PSNR**, versus 25% / 47.2 dB in fp32.
 
 Math (block size `r`, operating axis `dim=-2`):
 
@@ -78,6 +84,9 @@ from flashcodec import FlashCodecCache, apply_flash_codec
 
 # 1) Native: a first-class transformers 5.x Cache backend (any CausalLM)
 cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)  # 4×
+#    int8 coefficients: same shape, 15× smaller archive (quant_bits=8)
+cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2,
+                        quant_bits=8)                              # 15×
 out = model.generate(input_ids, max_new_tokens=64,
                      past_key_values=cache, use_cache=True)
 print(cache.get_seq_length(), cache.storage_bytes())
@@ -129,8 +138,10 @@ Measured on Qwen3.5-0.8B (bf16, CUDA, 48 greedy tokens, `benchmarks/run_qwen_dem
 | Tier | Storage vs raw KV | Output | Verdict |
 |---|---|---|---|
 | `png keep=1.0` | ~1.8× (fp32 deltas for exactness) | **bit-identical tokens to the unpatched model** | 100% fidelity baseline |
+| `jpeg k=8 int8` | **55.5%** (~1.8×) | fluent, **100% token match** | safe lossy tier |
 | `jpeg k=2` | **32.3%** (~3.1×) | fluent, 38.1% token match | lossy tier |
 | `jpeg k=4` | 54.8% (~1.8×) | fluent, 49.2% token match | lossy tier |
+| `jpeg k=2 int8` | **21.1%** (~4.7×) | fluent, 38.1% token match | lossy + int8 |
 
 Hybrid-layer audit: `codec_layers=6/24` (full attention only), zero warnings.
 Reproduce with `python benchmarks/run_qwen_demo.py` (offline; honors
@@ -163,19 +174,62 @@ python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
 | jpeg r=8 k=1 (8×) | 42.95 | 0.99943 | 12.5% |
 | jpeg r=8 k=2 (4×) | 47.22 | 0.99985 | 25.0% |
 | jpeg r=8 k=4 (2×) | 51.66 | 1.00001 | 50.0% |
+| jpeg r=8 k=2 int8 | 46.92 | 0.99983 | 6.6% |
+| jpeg r=8 k=4 int8 | 50.89 | 0.99999 | 13.3% |
 | png r=8 keep=0.5 | 50.11 | 0.99997 | 100% (sparsity → entropy coder) |
 | png r=8 keep=1.0 | ~196 (fp rounding) | 1.00000 | 100% |
+
+### Real KV statistics (real models, 512 tokens)
+
+`bench_reconstruct` uses a synthetic random walk; real caches are messier.
+Measured on real post-RoPE KV (`Var(Δ)/Var(X)` along the seq axis, and the
+fraction of block energy kept by the lowest k=2 DCT coefficients of a block of
+8):
+
+| model / layer | tensor | Var(Δ)/Var(X) | energy in k=2 |
+|---|---|---|---|
+| Qwen3-0.6B L0 | K | 0.16 | 0.94 |
+| Qwen3-0.6B L0 | V | 1.87 | 0.31 |
+| Qwen3-0.6B L27 | V | 1.02 | 0.59 |
+| Qwen3.5-0.8B L3 | K | 0.72 | 0.71 |
+| Qwen3.5-0.8B L23 | V | 0.09 | 0.97 |
+
+Values are frequently **anti**-correlated (ratio > 1), so "first differences
+collapse the variance" is a property of smooth synthetic signals, not of every
+real layer. Practical consequence: coefficient truncation (`k < r`) is a
+per-layer decision — on a dense model (28 compressed layers) the error compounds
+and quality collapses; use `k = r` + `quant_bits=8` there.
+
+### Perplexity (`benchmarks/bench_ppl.py`; 16 × 512 tokens, bf16, local corpus)
+
+| tier | Qwen3.5-0.8B (6/24 layers) | Qwen3-0.6B (28/28 layers) | storage |
+|---|---|---|---|
+| baseline | 22.4803 | 16.7931 | 100% |
+| png keep=1.0 | 22.4803 (+0.000) | 16.7931 (+0.000) | 188% |
+| jpeg k=8 (lossless basis) | 22.4877 (+0.007) | 16.8058 (+0.013) | 100% |
+| **jpeg k=8 int8** | **22.4991 (+0.019)** | **17.1348 (+0.34)** | **~52%** |
+| jpeg k=4 | 22.3010 (−0.18) | 470.85 (+454) | 50% |
+| jpeg k=2 | 24.0566 (+1.58) | 6485.5 (+6469) | 25% |
+| jpeg k=2 int8 | 24.0590 (+1.58) | 8118.5 (+8102) | 13% |
+
+The hybrid result is good because only 6 of 24 layers carry a codec (the 18
+linear-attention layers keep their native state); the dense model shows why
+per-layer truncation must not be applied blindly.
 
 ### Cache footprint & latency (`benchmarks/bench_vram.py`, CPU)
 
 | seq | Mode | storage | ratio | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 8.2ms | 0.5ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 28.1ms | 2.1ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 105.0ms | 5.2ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 196.6ms | 8.0ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 7.4ms | 0.1ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 31.6ms | 0.3ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 125.0ms | 3.2ms |
+| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 11.2ms | 0.1ms |
+| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 44.0ms | 0.4ms |
+| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 180.5ms | 3.2ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 224.1ms | 3.2ms |
 
-`read` = materialize the view and touch it (`.sum()`, so the number is the
+CPU timings vary ~±20% between runs (min of 3); the storage/ratio columns are
+exact. `read` = materialize the view and touch it (`.sum()`, so the number is the
 consumer cost, not just kernel launch). Decoding is memoized per archived block,
 so `read` costs one decode per **new** block instead of re-decoding the whole
 history on every decode step (previously 38.7ms / 71.9ms in the last two rows).
@@ -195,7 +249,7 @@ flashcodec/
 │   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
 ├── tests/                 # jpeg / png / causal suites (standalone scripts or pytest)
-├── benchmarks/            # storage benchmark + PSNR/cosine quality benchmark
+├── benchmarks/            # storage + PSNR/cosine + perplexity benchmarks
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
 ├── .github/workflows/     # CI: CPU tests + transformers integration
@@ -228,7 +282,14 @@ python tests/test_hf_integration.py # native transformers 5.x generate: explicit
   mid-block attention sees the block-level reconstruction (within-block
   approximation); the incremental `decode_step` path has no such issue.
 - Compressed tensors are dense layouts; PNG Top-M sparsity is not yet wired to
-  an entropy coder.
+  an entropy coder. (Packing sparse png alone was measured to be a wash: the
+  fp32 delta values dominate, and on bf16 input the packed form can be *larger*
+  than raw — delta quantization has to come first.)
+- Coefficient truncation (`k < r`) is a per-layer decision: on a dense model
+  every layer is compressed and the error compounds (measured: Qwen3-0.6B
+  perplexity 16.8 → 6486 at k=2). Use `k = r` + `quant_bits=8` there (~52%
+  storage, +2% ppl) and reserve aggressive ratios for hybrid models where only
+  the full-attention layers carry a codec.
 - Same lineage as the v4.2 prototypes inside
   [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
   (there: per-position view semantics for cross-layer KV reuse; here:

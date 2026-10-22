@@ -53,6 +53,11 @@ Read this whole file before making changes.
   `reset()` is the explicit invalidation point); (2) the reconstruction buffer is
   persistent, so steady-state memory includes one raw-KV-sized view (before, it was
   a per-read temporary — peak is unchanged, steady state is higher).
+- **jpeg int8 (`quant_bits=8`)**: coefficients are int8 plus a per-(block,
+  frequency) fp32 scale (`_scales (B,H,cap,k,1)`); decode = dequantize → DCT.
+  Real byte saving (fp32 archive 25% → 6.6%, bf16 archive 25% → ~13%) at ~0.3 dB
+  PSNR and +2% ppl on a dense model. png rejects `quant_bits` on purpose (the
+  lossless tier must keep fp32 deltas).
 
 ## dtype contract (distilled from Qwen3.5-0.8B practice; read before changing codecs)
 
@@ -103,6 +108,25 @@ Read this whole file before making changes.
 3. In the `mode="png", keep_ratio=1.0` lossless mode, stepwise decoding attention
    must align with the full forward pass within ≤1e-4 (the tests' correctness
    anchor).
+
+## Evaluation findings (measured; don't re-litigate without data)
+
+- **Real post-RoPE KV is not uniformly smooth.** `Var(Δ)/Var(X)` along seq:
+  K ≈ 0.16–0.72, V ≈ 0.09–1.87 across Qwen3-0.6B / Qwen3.5-0.8B layers (values
+  are often *anti*-correlated). The 30× variance-compression number in
+  `test_png` is a property of the synthetic random walk — keep
+  `bench_reconstruct` labelled synthetic and don't cite it as a real-KV claim.
+- **Truncation compounds per layer.** Dense Qwen3-0.6B (28/28 layers): ppl
+  16.79 → 470 (k=4) → 6486 (k=2). Hybrid Qwen3.5-0.8B (6/24 layers): 22.48 →
+  22.30 (k=4) → 24.06 (k=2). Safe default for dense models is **k = r +
+  `quant_bits=8`**: ~52% of bf16 storage, ppl 16.79 → 17.13 (+2%).
+- **Sparse-png packing alone is a wash** (fp32 delta values dominate; bf16 input
+  makes the packed form larger). Delta quantization would have to come first —
+  don't ship bit-packing without it.
+- **End-to-end overhead is small at short context** (Qwen3.5-0.8B, 48 new
+  tokens: baseline 47.0 tok/s vs 43.5–49.5 tok/s with codec tiers, peak +30MB),
+  but peak memory ≈ raw KV + archive because `read()` materializes a view;
+  memory wins need materialization-free kernels (flash-attention style).
 
 ## Design decisions (don't "refactor these away" in passing)
 

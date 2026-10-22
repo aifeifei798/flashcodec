@@ -71,6 +71,50 @@ def test_codec_class_api():
     assert abs(c.storage_ratio() - 0.25) < 1e-9       # k/r = 2/8
 
 
+def test_int8_quantization_quality_and_storage():
+    """int8 coefficients + per-(block, freq) scale: near-identical quality to
+    the fp32 coefficients and a real 4x smaller archive."""
+    from flashcodec import dequantize_coeffs, quantize_coeffs
+
+    smooth = torch.cumsum(torch.randn(B, H, S, D) * 0.1, dim=-2)
+    coef = dct_compress(smooth, R, 2)
+    q, s = quantize_coeffs(coef)
+    assert q.dtype == torch.int8 and q.abs().max().item() <= 127
+    assert s.shape == coef.shape[:-1] + (1,)
+    deq = dequantize_coeffs(q, s)
+    err = (deq - coef).abs().max().item()
+    assert err <= s.max().item() / 2 + 1e-6, \
+        f"quantization error exceeds half a step: {err:.3e}"
+
+    cos_ref = torch.nn.functional.cosine_similarity(
+        dct_decompress(coef, R, S).flatten(), smooth.flatten(), dim=0).item()
+    cos_q = torch.nn.functional.cosine_similarity(
+        dct_decompress(deq, R, S).flatten(), smooth.flatten(), dim=0).item()
+    assert cos_q > 0.99, f"int8 cosine too low: {cos_q:.5f}"
+    assert cos_q >= cos_ref - 1e-3, \
+        f"int8 quantization must not degrade quality: {cos_ref:.5f} -> {cos_q:.5f}"
+
+
+def test_codec_int8_api():
+    from flashcodec import make_codec
+
+    c = make_codec("jpeg", block_size=R, keep_freqs=2, quant_bits=8)
+    assert c.quantized and c.quant_bits == 8
+    q, s = c.quantize(c.compress(x))
+    rec = c.decompress(q, out_len=S, scales=s)
+    assert rec.shape == x.shape and rec.dtype == x.dtype
+    assert c.storage_ratio() < 0.25 / 3, "int8 must beat the k/r geometric ratio"
+
+    plain = JPEGCodec(block_size=R, keep_freqs=2)
+    assert not plain.quantized and plain.quantize(plain.compress(x)) == (None, None)
+
+    try:
+        make_codec("png", quant_bits=8)
+        raise AssertionError("png must reject quant_bits (lossless tier)")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

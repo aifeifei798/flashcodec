@@ -35,6 +35,8 @@ CONFIGS = [
     ("jpeg", dict(mode="jpeg", keep_freqs=1)),
     ("jpeg", dict(mode="jpeg", keep_freqs=2)),
     ("jpeg", dict(mode="jpeg", keep_freqs=4)),
+    ("jpeg", dict(mode="jpeg", keep_freqs=2, quant_bits=8)),
+    ("jpeg", dict(mode="jpeg", keep_freqs=4, quant_bits=8)),
     ("png", dict(mode="png", keep_ratio=0.25)),
     ("png", dict(mode="png", keep_ratio=0.5)),
     ("png", dict(mode="png", keep_ratio=1.0)),
@@ -51,6 +53,7 @@ for _, kw in CONFIGS:
     s = cache.stats(0)
     name = (f"{kw['mode']} r=8"
             + (f" k={kw['keep_freqs']}" if kw["mode"] == "jpeg"
-               else f" keep={kw['keep_ratio']}"))
+               else f" keep={kw['keep_ratio']}")
+            + (" int8" if kw.get("quant_bits") else ""))
     print(f"{name:<16} | {psnr(x, hat):>9.2f} | {cos(x, hat):>8.5f} | "
           f"{s['storage_bytes'] / s['raw_bytes']:>7.2%}")

@@ -49,7 +49,7 @@ gen_kw = dict(max_new_tokens=NEW, min_new_tokens=NEW, do_sample=False,
               pad_token_id=tok.eos_token_id)
 
 
-def report(tag, out, cache=None):
+def report(tag, out, cache=None, secs=None, peak=None):
     text = tok.decode(out[0], skip_special_tokens=True)
     print(f"[{tag}] {text!r}")
     if cache is not None:
@@ -58,32 +58,53 @@ def report(tag, out, cache=None):
         # raw baseline: full KV of the codec layers only (B,H,S,D x key+value)
         l0 = cache.layers[cache.codec_layer_indices()[0]]
         raw = n_codec * l0.keys.numel() * l0.keys.element_size() * 2
+        extra = (f" | {NEW / secs:.1f} tok/s" if secs else "")
         print(f"       seq={cache.get_seq_length()} codec_layers={n_codec}/{n_layers} "
               f"storage={st/1e6:.2f}MB raw={raw/1e6:.2f}MB "
-              f"ratio={st/raw:.2%} | decode {dt[0]:.1f}s")
+              f"ratio={st/raw:.2%}{extra}"
+              + (f" peak=+{peak:.0f}MB" if peak is not None else ""))
+    elif secs:
+        print(f"       {NEW / secs:.1f} tok/s"
+              + (f" peak=+{peak:.0f}MB" if peak is not None else ""))
     return out
 
 
-dt = [0.0]
+def gen_timed(**kw):
+    """Generate with a fair timing: synchronize (CUDA is async) and report the
+    peak memory allocated on top of the model weights."""
+    if device == "cuda":
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    with torch.no_grad():
+        out = model.generate(input_ids=ids, **gen_kw, **kw)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    dt = time.time() - t0
+    peak = ((torch.cuda.max_memory_allocated() - base) / 1e6
+            if device == "cuda" else 0.0)
+    return out, dt, peak
+
+
+# warm up the kernels so the first timed run is not measuring lazy init
+with torch.no_grad():
+    model.generate(input_ids=ids, max_new_tokens=2, do_sample=False,
+                   pad_token_id=tok.eos_token_id)
+
+
 with warnings.catch_warnings(record=True) as wlist:
     warnings.simplefilter("always")
 
     # ---- 1) Baseline (unpatched) ----
-    t0 = time.time()
-    with torch.no_grad():
-        ref = model.generate(input_ids=ids, **gen_kw)
-    dt[0] = time.time() - t0
-    report("baseline", ref)
+    ref, secs, peak = gen_timed()
+    report("baseline", ref, secs=secs, peak=peak)
 
     # ---- 2) PNG lossless mode: bitwise identity (ultimate correctness check) ----
     apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
-    cache = model._flashcodec["caches"]
-    t0 = time.time()
-    with torch.no_grad():
-        out_png = model.generate(input_ids=ids, **gen_kw)
-    dt[0] = time.time() - t0
+    out_png, secs, peak = gen_timed()
     cache = model._flashcodec["caches"][-1]
-    report("png keep=1.0", out_png, cache)
+    report("png keep=1.0", out_png, cache, secs=secs, peak=peak)
     exact = torch.equal(ref, out_png)
     print(f"       ✅ generated tokens bitwise-identical to baseline: {exact}"
           if exact else "       ❌ generated tokens differ from baseline!")
@@ -95,14 +116,19 @@ with warnings.catch_warnings(record=True) as wlist:
     remove_flash_codec(model)
 
     # ---- 3) JPEG lossy mode: fluency + storage ratio + token agreement ----
-    for k in (2, 4):
-        apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=k)
-        t0 = time.time()
-        with torch.no_grad():
-            out_j = model.generate(input_ids=ids, **gen_kw)
-        dt[0] = time.time() - t0
+    tiers = [
+        ("jpeg k=8 int8",
+         dict(mode="jpeg", block_size=8, keep_freqs=8, quant_bits=8)),
+        ("jpeg k=2", dict(mode="jpeg", block_size=8, keep_freqs=2)),
+        ("jpeg k=4", dict(mode="jpeg", block_size=8, keep_freqs=4)),
+        ("jpeg k=2 int8",
+         dict(mode="jpeg", block_size=8, keep_freqs=2, quant_bits=8)),
+    ]
+    for tag, kw in tiers:
+        apply_flash_codec(model, **kw)
+        out_j, secs, peak = gen_timed()
         cache = model._flashcodec["caches"][-1]
-        report(f"jpeg k={k}", out_j, cache)
+        report(tag, out_j, cache, secs=secs, peak=peak)
         same = (out_j == ref).float().mean().item()
         print(f"       token agreement vs baseline: {same:.1%}")
         remove_flash_codec(model)

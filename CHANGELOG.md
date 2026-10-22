@@ -8,6 +8,28 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [0.3.0] — 2026-10-23
+
+### Added
+
+- **`quant_bits=8` for the jpeg codec**: coefficients are stored as int8 with a
+  per-(block, frequency) fp32 scale. A real byte-level saving on top of the
+  `k/r` geometric ratio: 6.6% of fp32 raw KV at k=2, ~52% of bf16 raw KV at
+  k=8 (full lossless DCT basis) with +2% perplexity on a dense model.
+- **`benchmarks/bench_ppl.py`**: perplexity evaluation on a local corpus, run
+  against a dense model (Qwen3-0.6B) and a hybrid one (Qwen3.5-0.8B).
+- **Honest measurement fixes**: `bench_vram --cuda` now uses CUDA events plus a
+  warmup (the old numbers were async and meaningless), and `run_qwen_demo`
+  reports tokens/s and peak memory.
+- README (EN/ZH): real-KV statistics and perplexity tables.
+
+### Changed
+
+- README claims about autocorrelation and "30× variance compression" are now
+  qualified with measured real-model statistics; the dense-model caveat
+  (coefficient truncation compounds per layer) is documented, with
+  `k = r + quant_bits=8` as the safe tier for fully compressible models.
+
 ## [0.2.0] — 2026-10-23
 
 ### Added

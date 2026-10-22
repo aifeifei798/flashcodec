@@ -34,7 +34,8 @@ def find_attention_modules(model):
 
 def _make_factory(mode, block_size, kwargs, sink, config=None):
     codec_kw = dict(keep_freqs=kwargs.get("keep_freqs", 2),
-                    keep_ratio=kwargs.get("keep_ratio", 1.0))
+                    keep_ratio=kwargs.get("keep_ratio", 1.0),
+                    quant_bits=kwargs.get("quant_bits", 0))
     if HAS_HF_CACHE:
         def factory():
             c = None
@@ -61,8 +62,9 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
     """One-line hot patch: inject a codec KV cache into model (native
     transformers 5.x).
 
-    Supports mode="jpeg" (kwargs: keep_freqs, default 2) and
-    mode="png" (kwargs: keep_ratio, default 1.0).
+    Supports mode="jpeg" (kwargs: keep_freqs, default 2; quant_bits, default 0
+    or 8 for int8 coefficients) and mode="png" (kwargs: keep_ratio, default
+    1.0).
     Afterwards every `model.generate(..., use_cache=True)` call that does not
     pass past_key_values explicitly uses FlashCodecCache. Returns model;
     `remove_flash_codec(model)` restores it at any time."""

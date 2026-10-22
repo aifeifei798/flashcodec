@@ -172,6 +172,24 @@ def test_f_crop_matches_unpatched():
     assert d < 1e-2, f"crop boundary logits drifted: maxdiff={d:.2e}"
 
 
+def test_g_int8_generation():
+    """int8 coefficients work end to end through generate and shrink the
+    archive well below the same cache in fp32 (the raw tail is shared, so
+    compare against the unquantized codec rather than raw KV)."""
+    model = build_tiny_llama()
+    plain = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)
+    gen(model, past_key_values=plain)
+    model = build_tiny_llama()
+    cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2,
+                            quant_bits=8)
+    out = gen(model, past_key_values=cache)
+    assert out.shape == (1, PROMPT_LEN + NEW)
+    assert cache.get_seq_length() == PROMPT_LEN + NEW - 1
+    assert cache.storage_bytes() < 0.7 * plain.storage_bytes(), (
+        f"int8 storage not active: {cache.storage_bytes()} vs fp "
+        f"{plain.storage_bytes()}")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

@@ -82,29 +82,78 @@ def dct_decompress(coeffs, r, out_len=None):
     return rec
 
 
+def quantize_coeffs(coeffs, bits=8):
+    """Symmetric per-(block, frequency) quantization of DCT coefficients.
+
+    coeffs (..., n, k, D) -> (q int8, scale fp32 of shape (..., n, k, 1)).
+    One scale per block **and** frequency row: the DC row and the AC rows have
+    very different magnitudes, and a row-wise scale costs only 4 bytes per row
+    (vs D*1 byte for the int8 row itself).
+    """
+    if bits != 8:
+        raise ValueError(f"only 8-bit coefficient quantization is supported, "
+                         f"got bits={bits}")
+    amax = coeffs.abs().amax(dim=-1, keepdim=True)          # (...,n,k,1)
+    scale = amax / 127.0
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    q = torch.round(coeffs.float() / scale).clamp_(-127, 127).to(torch.int8)
+    return q, scale.to(torch.float32)
+
+
+def dequantize_coeffs(q, scale):
+    """int8 coefficients + per-row scale -> fp32 coefficients."""
+    return q.float() * scale
+
+
 class JPEGCodec:
     """JPEG-style lossy frequency-domain codec (stateless, shareable across
-    caches)."""
+    caches). ``quant_bits=8`` additionally stores the DCT coefficients as int8
+    with a per-(block, frequency) scale — a real byte-level saving on top of the
+    k/r geometric ratio (the scales cost 4 bytes per row)."""
 
     name = "jpeg"
 
-    def __init__(self, block_size=8, keep_freqs=2):
+    def __init__(self, block_size=8, keep_freqs=2, quant_bits=0):
         assert 1 <= keep_freqs <= block_size, \
             f"keep_freqs must be within [1, {block_size}]"
+        assert quant_bits in (0, 8), \
+            f"quant_bits must be 0 (store in input dtype) or 8, got {quant_bits}"
         self.block_size = block_size
         self.keep_freqs = keep_freqs
+        self.quant_bits = quant_bits
+
+    @property
+    def quantized(self):
+        return self.quant_bits > 0
 
     def compress(self, x):
         return dct_compress(x, self.block_size, self.keep_freqs)
 
-    def decompress(self, coeffs, out_len=None):
+    def quantize(self, coeffs):
+        """Coefficients -> (int8, scale) when quantized, else (None, None)."""
+        if not self.quantized:
+            return None, None
+        return quantize_coeffs(coeffs, self.quant_bits)
+
+    def decompress(self, coeffs, out_len=None, scales=None):
+        if self.quantized:
+            assert scales is not None, "quantized codec needs the scales"
+            coeffs = dequantize_coeffs(coeffs, scales)
         return dct_decompress(coeffs, self.block_size, out_len)
 
     def storage_ratio(self):
-        """Archive tensor element count / original element count (excluding the
-        raw tail)."""
-        return self.keep_freqs / self.block_size
+        """Archive bytes / original bytes **assuming fp32 input** (excluding the
+        raw tail). Non-quantized: k/r. Quantized: (k*D + k*4) / (r*D*4)."""
+        if not self.quantized:
+            return self.keep_freqs / self.block_size
+        # D cancels out only in the element-count sense; report per fp32 element
+        # with D=1 for the generic bound and make the byte count exact in
+        # storage_bytes(); here we use the k/r geometric ratio scaled by the
+        # int8-vs-fp32 element ratio, ignoring the (tiny) scale overhead.
+        return (self.keep_freqs / self.block_size) / 4.0
 
     def __repr__(self):
+        q = f", quant_bits={self.quant_bits}" if self.quantized else ""
         return (f"JPEGCodec(block_size={self.block_size}, "
-                f"keep_freqs={self.keep_freqs})")
+                f"keep_freqs={self.keep_freqs}{q})")
+

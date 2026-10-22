@@ -185,6 +185,27 @@ def test_reorder_cache_matches_batch_permutation():
         assert c.get_seq_length(0) == S + 1
 
 
+def test_quantized_stream_causal_and_incremental():
+    """int8 archives keep the same causal / incremental contract and deliver a
+    real byte-level saving (not just the k/r element ratio)."""
+    cq = CodecKVCache(mode="jpeg", block_size=R, keep_freqs=2, quant_bits=8)
+    kq, vq = cq.forward(k_seq, v_seq)
+    ci = _fill_incr("jpeg", block_size=R, keep_freqs=2, quant_bits=8)
+    dk = (kq - ci.key_cache[0]).abs().max().item()
+    dv = (vq - ci.value_cache[0]).abs().max().item()
+    assert dk < 1e-5 and dv < 1e-5, \
+        f"int8 full/incremental mismatch: k={dk:.2e} v={dv:.2e}"
+
+    plain = CodecKVCache(mode="jpeg", block_size=R, keep_freqs=2)
+    plain.forward(k_seq, v_seq)
+    assert cq.storage_bytes(0) < 0.5 * plain.storage_bytes(0), \
+        "int8 archive must be at least 2x smaller than the fp archive"
+
+    cq.crop(-5)
+    cq.reorder_cache(torch.tensor([1, 0]))
+    assert cq.get_seq_length(0) == S - 5
+
+
 def test_forward_fill_vs_incremental_view():
     """The two fill paths must agree: png is bitwise-identical (cumsum is
     per-block and grouping-independent), jpeg within fp rounding (batched-GEMM

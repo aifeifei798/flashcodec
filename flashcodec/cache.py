@@ -36,11 +36,20 @@ except Exception:                          # fallback when transformers is absen
     HAS_HF_CACHE = False
 
 
-def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0):
-    """Build a codec instance from a mode name."""
+def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0,
+               quant_bits=0):
+    """Build a codec instance from a mode name.
+
+    ``quant_bits=8`` switches the jpeg archive to int8 coefficients with a
+    per-(block, frequency) scale (real byte-level saving); png ignores it (its
+    lossless tier stores fp32 deltas on purpose)."""
     if mode == "jpeg":
-        return JPEGCodec(block_size=block_size, keep_freqs=keep_freqs)
+        return JPEGCodec(block_size=block_size, keep_freqs=keep_freqs,
+                         quant_bits=quant_bits)
     if mode == "png":
+        if quant_bits:
+            raise ValueError("quant_bits is only supported for mode='jpeg' "
+                             "(the png lossless tier must keep fp32 deltas)")
         return PNGCodec(block_size=block_size, keep_ratio=keep_ratio)
     raise ValueError(f"unknown mode: {mode!r} (expected 'jpeg' | 'png')")
 
@@ -53,7 +62,8 @@ class _CodecStream:
     once as an in-place slice (no reallocation), and read() runs a single
     large GEMM / cumsum over the valid region — eliminating per-archive
     Python loops and fragmented kernel launches entirely.
-    jpeg: ``_coeffs (B,H,capacity,k,D)`` (input dtype);
+    jpeg: ``_coeffs (B,H,capacity,k,D)`` (input dtype), or int8 +
+    ``_scales (B,H,capacity,k,1)`` fp32 when the codec is quantized;
     png:  ``_deltas (B,H,capacity,r-1,D)`` (fp32) + ``_anchors (B,H,capacity,D)``.
     """
 
@@ -68,6 +78,7 @@ class _CodecStream:
         self.dtype = None        # stream input dtype (restored; SDPA dtype contract)
         self._capacity = 0       # blocks allocated in the archive (geometric growth)
         self._coeffs = None      # jpeg: (B,H,capacity,k,D)
+        self._scales = None      # jpeg+int8: (B,H,capacity,k,1) fp32
         self._deltas = None      # png:  (B,H,capacity,r-1,D) fp32
         self._anchors = None     # png:  (B,H,capacity,D)
         # Incrementally decoded archive (append-only, one decode per new
@@ -80,6 +91,18 @@ class _CodecStream:
     def block_size(self):
         return self.codec.block_size
 
+    def _archive_spec(self, cap, B, H, D):
+        """(attr, shape, dtype) for every archive tensor at capacity `cap`."""
+        if self.codec.name == "jpeg":
+            k = self.codec.keep_freqs
+            if self.codec.quantized:
+                return [("_coeffs", (B, H, cap, k, D), torch.int8),
+                        ("_scales", (B, H, cap, k, 1), torch.float32)]
+            return [("_coeffs", (B, H, cap, k, D), self.dtype)]
+        r = self.block_size
+        return [("_deltas", (B, H, cap, r - 1, D), torch.float32),
+                ("_anchors", (B, H, cap, D), self.dtype)]
+
     def _grow(self, need_blocks, like):
         """Geometric growth: when capacity is insufficient, double until
         >= need_blocks and copy the old data over verbatim."""
@@ -89,22 +112,12 @@ class _CodecStream:
         while cap < need_blocks:
             cap *= 2
         B, H, D = like.shape[0], like.shape[1], like.shape[-1]
-        if self.codec.name == "jpeg":
-            new = torch.empty((B, H, cap, self.codec.keep_freqs, D),
-                              dtype=self.dtype, device=like.device)
+        for attr, shape, dtype in self._archive_spec(cap, B, H, D):
+            new = torch.empty(shape, dtype=dtype, device=like.device)
             if self.n_blocks:
-                new[:, :, :self.n_blocks].copy_(self._coeffs[:, :, :self.n_blocks])
-            self._coeffs = new
-        else:
-            r = self.block_size
-            new_d = torch.empty((B, H, cap, r - 1, D), dtype=torch.float32,
-                                device=like.device)
-            new_a = torch.empty((B, H, cap, D), dtype=self.dtype,
-                                device=like.device)
-            if self.n_blocks:
-                new_d[:, :, :self.n_blocks].copy_(self._deltas[:, :, :self.n_blocks])
-                new_a[:, :, :self.n_blocks].copy_(self._anchors[:, :, :self.n_blocks])
-            self._deltas, self._anchors = new_d, new_a
+                new[:, :, :self.n_blocks].copy_(
+                    getattr(self, attr)[:, :, :self.n_blocks])
+            setattr(self, attr, new)
         self._capacity = cap
 
     def _archive(self, head):
@@ -114,7 +127,13 @@ class _CodecStream:
         self._grow(self.n_blocks + n_full, head)
         sl = slice(self.n_blocks, self.n_blocks + n_full)
         if self.codec.name == "jpeg":
-            self._coeffs[:, :, sl].copy_(self.codec.compress(head))
+            coeffs = self.codec.compress(head)
+            q, s = self.codec.quantize(coeffs)
+            if self.codec.quantized:
+                self._coeffs[:, :, sl].copy_(q)
+                self._scales[:, :, sl].copy_(s)
+            else:
+                self._coeffs[:, :, sl].copy_(coeffs)
         else:
             delta, anchor = self.codec.filter(head)
             self._deltas[:, :, sl].copy_(delta)
@@ -161,7 +180,10 @@ class _CodecStream:
                 new[:, :, :done].copy_(self._rec[:, :, :done])
             self._rec, self._rec_capacity = new, cap
         if self.codec.name == "jpeg":
-            rec = dct_decompress(self._coeffs[:, :, a:b], r)
+            rec = self.codec.decompress(
+                self._coeffs[:, :, a:b],
+                scales=(self._scales[:, :, a:b]
+                        if self.codec.quantized else None))
             if rec.dtype != self.dtype:
                 rec = rec.to(self.dtype)
         else:
@@ -251,24 +273,13 @@ class _CodecStream:
                 self._rec = new_r
             return
         B, H, D = idx.numel(), like.shape[1], like.shape[-1]
-        if self.codec.name == "jpeg":
-            new = torch.empty((B, H, self._capacity, self.codec.keep_freqs, D),
-                              dtype=self._coeffs.dtype, device=like.device)
+        for attr, shape, dtype in self._archive_spec(self._capacity, B, H, D):
+            old = getattr(self, attr)
+            new = torch.empty(shape, dtype=dtype, device=like.device)
             if self.n_blocks:
-                new[:, :, :self.n_blocks] = self._coeffs[
+                new[:, :, :self.n_blocks] = old[
                     :, :, :self.n_blocks].index_select(0, idx)
-            self._coeffs = new
-        else:
-            new_d = torch.empty((B, H, self._capacity, r - 1, D),
-                                dtype=torch.float32, device=like.device)
-            new_a = torch.empty((B, H, self._capacity, D),
-                                dtype=self._anchors.dtype, device=like.device)
-            if self.n_blocks:
-                new_d[:, :, :self.n_blocks] = self._deltas[
-                    :, :, :self.n_blocks].index_select(0, idx)
-                new_a[:, :, :self.n_blocks] = self._anchors[
-                    :, :, :self.n_blocks].index_select(0, idx)
-            self._deltas, self._anchors = new_d, new_a
+            setattr(self, attr, new)
         if self._rec is not None:
             new_r = torch.empty((B, H, self._rec_capacity, D),
                                 dtype=self._rec.dtype, device=like.device)
@@ -282,9 +293,10 @@ class _CodecStream:
             self.meta = (B,) + self.meta[1:]
 
     def _archive_tensors(self):
-        """Live archive tensors (shared by batch ops)."""
+        """Live archive tensors (shared by batch ops / storage accounting)."""
         if self.codec.name == "jpeg":
-            return (self._coeffs,)
+            return ((self._coeffs, self._scales) if self.codec.quantized
+                    else (self._coeffs,))
         return (self._deltas, self._anchors)
 
     @property
@@ -293,15 +305,13 @@ class _CodecStream:
 
     def storage_bytes(self):
         """Logical storage (valid region + raw tail), excluding the idle
-        capacity reserved by the doubling preallocation."""
+        capacity reserved by the doubling preallocation and the persistent
+        reconstruction view (`_rec`)."""
         total = 0
         if self.n_blocks:
-            view = (self._coeffs if self.codec.name == "jpeg"
-                    else self._deltas)
-            total += view[:, :, :self.n_blocks].numel() * view.element_size()
-            if self.codec.name == "png":
-                total += (self._anchors[:, :, :self.n_blocks].numel()
-                          * self._anchors.element_size())
+            for t in self._archive_tensors():
+                total += (t[:, :, :self.n_blocks].numel()
+                          * t.element_size())
         if self.raw is not None:
             total += self.raw.numel() * self.raw.element_size()
         return total
@@ -318,9 +328,10 @@ class CodecKVCache:
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0):
+                 keep_ratio=1.0, quant_bits=0):
         self.mode = mode
-        self.codec = make_codec(mode, block_size, keep_freqs, keep_ratio)
+        self.codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
+                                quant_bits=quant_bits)
         self._keys = {}
         self._values = {}
 
@@ -432,9 +443,10 @@ class FlashCodecLayer(_HFDynamicLayer):
     layer, requiring zero model surgery."""
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0):
+                 keep_ratio=1.0, quant_bits=0):
         super().__init__()
-        codec = make_codec(mode, block_size, keep_freqs, keep_ratio)
+        codec = make_codec(mode, block_size, keep_freqs, keep_ratio,
+                           quant_bits=quant_bits)
         self.mode = mode
         self.codec = codec
         self._key_stream = _CodecStream(codec)
@@ -540,7 +552,7 @@ class FlashCodecCache(_HFCache):
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
-                 keep_ratio=1.0):
+                 keep_ratio=1.0, quant_bits=0):
         if not HAS_HF_CACHE:
             raise ImportError(
                 "FlashCodecCache requires transformers 5.x (this project only "
@@ -550,10 +562,11 @@ class FlashCodecCache(_HFCache):
             layers=None,
             layer_class_to_replicate=partial(
                 FlashCodecLayer, mode=mode, block_size=block_size,
-                keep_freqs=keep_freqs, keep_ratio=keep_ratio))
+                keep_freqs=keep_freqs, keep_ratio=keep_ratio,
+                quant_bits=quant_bits))
         self.mode = mode
         self.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
-                              keep_ratio=keep_ratio)
+                              keep_ratio=keep_ratio, quant_bits=quant_bits)
 
     @property
     def _seen_tokens(self):
@@ -563,7 +576,7 @@ class FlashCodecCache(_HFCache):
 
     @classmethod
     def from_config(cls, config, mode="jpeg", block_size=8, keep_freqs=2,
-                    keep_ratio=1.0):
+                    keep_ratio=1.0, quant_bits=0):
         """Build the mixed-layer list from the model config (Qwen3.5-style
         hybrid architectures): only full_attention layers get a codec layer,
         while the remaining layer types (linear_attention / sliding, etc.)
@@ -586,14 +599,14 @@ class FlashCodecCache(_HFCache):
             if ltype == "full_attention":
                 layers.append(FlashCodecLayer(
                     mode=mode, block_size=block_size, keep_freqs=keep_freqs,
-                    keep_ratio=keep_ratio))
+                    keep_ratio=keep_ratio, quant_bits=quant_bits))
             else:
                 layers.append(DYNAMIC_LAYER_TYPE_MAPPING[ltype](**lkw))
         obj = cls.__new__(cls)
         _HFCache.__init__(obj, layers=layers, layer_class_to_replicate=None)
         obj.mode = mode
         obj.codec_cfg = dict(block_size=block_size, keep_freqs=keep_freqs,
-                             keep_ratio=keep_ratio)
+                             keep_ratio=keep_ratio, quant_bits=quant_bits)
         return obj
 
     def codec_layer_indices(self):
