@@ -1,8 +1,11 @@
-"""因果安全与 Cache 一致性测试：
-1) 未来扰动零泄露（已归档块张量逐位不变，全量/增量两种模式）
-2) 增量解码（lossless png）与全量前向的注意力输出对齐 ≤1e-4
-3) forward 填充与逐步填充的缓存视图逐位一致
-4) jpeg 有损档位的注意力输出质量（余弦报告）
+"""Causal safety and cache-consistency tests:
+1) Zero leakage from future perturbations (archived block tensors stay
+   bitwise-identical, in both full and incremental modes)
+2) Incremental decoding (lossless png) aligns with the full forward
+   pass in attention output to within 1e-4
+3) The cache view from forward filling is bitwise-identical to the one
+   from step-by-step filling
+4) Attention-output quality of the lossy jpeg tier (cosine report)
 """
 
 import math
@@ -23,7 +26,8 @@ v_seq = torch.randn(B, H, S, D)
 
 
 def toy_attn(q, k, v):
-    """单段因果注意力（B,H,S_q,D）：q 与全量 KV 的缩放点积 + causal mask。"""
+    """Single-segment causal attention (B,H,S_q,D): scaled dot product of
+    q against the full KV, plus a causal mask."""
     Sq, Sk = q.shape[-2], k.shape[-2]
     logits = q @ k.transpose(-2, -1) / math.sqrt(D)
     mask = torch.ones(Sq, Sk, dtype=torch.bool, device=q.device).tril(
@@ -40,7 +44,8 @@ def _fill_incr(mode, **kw):
 
 
 def _archive_tensors(st):
-    """归档区有效区快照（倍增预分配存储的逻辑视图）。"""
+    """Snapshot of the archive's valid region (logical view of the
+    doubling preallocated storage)."""
     if st.codec.name == "jpeg":
         return [st._coeffs[:, :, :st.n_blocks]]
     return [st._deltas[:, :, :st.n_blocks], st._anchors[:, :, :st.n_blocks]]
@@ -48,47 +53,49 @@ def _archive_tensors(st):
 
 def test_future_perturbation_zero_leak_decode():
     c = CodecKVCache(mode="png", block_size=R, keep_ratio=0.5)
-    cut = 2 * R                                  # 已归档 2 个整块
+    cut = 2 * R                                  # 2 whole blocks archived
     for t in range(cut):
         c.decode_step(k_seq[..., t:t + 1, :], v_seq[..., t:t + 1, :])
     snap = [[t.clone() for t in _archive_tensors(st)]
             for st in (c._keys[0], c._values[0])]
     view_before = c.key_cache[0].clone()
     pert = torch.randn_like(k_seq[..., cut:, :])
-    for t in range(cut, S):                      # 扰动未来 token
+    for t in range(cut, S):                      # perturb future tokens
         c.decode_step(pert[..., t - cut:t - cut + 1, :],
                       pert[..., t - cut:t - cut + 1, :])
     for st, snap_i in zip((c._keys[0], c._values[0]), snap):
         for ar, ar0 in zip(_archive_tensors(st), snap_i):
-            # 归档区是倍增预分配的连续存储：有效区只增不改，
-            # 已快照的历史前缀必须逐位不变
+            # The archive is one contiguous doubling-preallocated buffer:
+            # its valid region only grows and is never rewritten, so the
+            # snapshotted historical prefix must stay bitwise-identical
             n0 = ar0.shape[2]
             assert torch.equal(ar[:, :, :n0], ar0), \
-                "未来扰动改写了已归档张量"
+                "a future perturbation rewrote archived tensors"
     assert torch.equal(c.key_cache[0][..., :cut, :], view_before[..., :cut, :]), \
-        "未来扰动改写了历史视图"
+        "a future perturbation rewrote the historical view"
 
 
 def test_future_perturbation_zero_leak_forward():
     c1 = CodecKVCache(mode="jpeg", block_size=R, keep_freqs=2)
     c2 = CodecKVCache(mode="jpeg", block_size=R, keep_freqs=2)
-    cut = 3 * R                                  # 块对齐的截断点
+    cut = 3 * R                                  # block-aligned cut point
     k2 = k_seq.clone()
     k2[..., cut:, :] = torch.randn_like(k2[..., cut:, :])
     c1.forward(k_seq, v_seq)
     c2.forward(k2, v_seq)
-    # 全量模式下所有完整块一次归档进倍增存储
-    # (B,H,n_blocks,k,D)；块维在 -3
+    # In full mode every complete block is archived in one pass into the
+    # doubling storage (B,H,n_blocks,k,D); the block dim is -3
     s1, s2 = c1._keys[0], c2._keys[0]
     a1, a2 = _archive_tensors(s1)[0], _archive_tensors(s2)[0]
     assert torch.equal(a1[..., :3, :, :], a2[..., :3, :, :]), \
-        "全量模式下未来扰动影响了历史归档"
+        "in full mode a future perturbation affected the historical archive"
     assert torch.equal(c1.key_cache[0][..., :cut, :],
                        c2.key_cache[0][..., :cut, :])
 
 
 def test_incremental_vs_full_attention_lossless():
-    """lossless png cache 下，逐步解码注意力 == 全量前向注意力（≤1e-4）。"""
+    """With a lossless png cache, step-by-step decoding attention ==
+    full forward pass attention (<=1e-4)."""
     q = torch.randn(B, H, S, D)
     c_full = CodecKVCache(mode="png", block_size=R, keep_ratio=1.0)
     kf, vf = c_full.forward(k_seq, v_seq)
@@ -102,7 +109,8 @@ def test_incremental_vs_full_attention_lossless():
         outs.append(toy_attn(q[..., t:t + 1, :], kt, vt))
     out_incr = torch.cat(outs, dim=-2)
     d = (out_full - out_incr).abs().max().item()
-    assert d < 1e-4, f"增量解码与全量前向不一致: maxdiff={d:.2e}"
+    assert d < 1e-4, \
+        f"incremental decoding disagrees with full forward: maxdiff={d:.2e}"
 
 
 def test_forward_fill_vs_incremental_view_bitwise():
@@ -113,7 +121,8 @@ def test_forward_fill_vs_incremental_view_bitwise():
     c3 = CodecKVCache(mode="jpeg", block_size=R, keep_freqs=2)
     k3, _ = c3.forward(k_seq, v_seq)
     c4 = _fill_incr("jpeg", block_size=R, keep_freqs=2)
-    assert torch.equal(k3, c4.key_cache[0]), "jpeg 全量/增量视图应逐位一致"
+    assert torch.equal(k3, c4.key_cache[0]), \
+        "jpeg full/incremental views must be bitwise-identical"
 
 
 def test_jpeg_attention_quality_report():
@@ -125,8 +134,8 @@ def test_jpeg_attention_quality_report():
     out_q = toy_attn(q, kq, vq)
     cos = torch.nn.functional.cosine_similarity(
         out_exact.flatten(), out_q.flatten(), dim=0).item()
-    print(f"   jpeg(r=8,k=2) 注意力输出余弦 = {cos:.4f}")
-    assert cos > 0.99, f"jpeg 档位注意力质量过低: cos={cos:.4f}"
+    print(f"   jpeg(r=8,k=2) attention output cosine = {cos:.4f}")
+    assert cos > 0.99, f"jpeg tier attention quality too low: cos={cos:.4f}"
 
 
 if __name__ == "__main__":

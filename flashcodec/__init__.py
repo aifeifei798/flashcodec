@@ -1,10 +1,13 @@
-"""flashcodec —— 把时序 KV Cache 张量当作"高维多媒体图像信号"来压缩。
+"""flashcodec — compress time-series KV cache tensors as "high-dimensional
+multimedia image signals".
 
-两大经典压缩理论迁移至 Transformer KV Cache 管理：
-- mode="jpeg"：正交分块 1D DCT-II，有损频域压缩（低频骨架）；
-- mode="png"：因果分块预测差分，无损/近无损时域压缩（锚点 + Δ）。
+Two classic compression theories ported to Transformer KV cache management:
+- mode="jpeg": blockwise 1D DCT-II over an orthonormal basis, lossy
+  frequency-domain compression (low-frequency skeleton);
+- mode="png": causal blockwise prediction deltas, lossless/near-lossless
+  time-domain compression (anchor + Δ).
 
-张量契约：KV 布局 (B, H, S, D)，压缩轴 dim=-2（seq 轴）。
+Tensor contract: KV layout (B, H, S, D), compression axis dim=-2 (seq axis).
 """
 
 from .cache import HAS_HF_CACHE, CodecKVCache, FlashCodecCache, \

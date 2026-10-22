@@ -1,7 +1,8 @@
-"""显存/存储压测：对比 4K/16K/64K 序列下原始 KV 与各编解码档位的
-实际缓存占用（tensor storage bytes）与填充/读取耗时。
+"""VRAM/storage benchmark: compares raw KV against each codec mode at 4K/16K/64K
+sequence lengths, reporting actual cache occupancy (tensor storage bytes) and
+fill/read timings.
 
-用法：.venv/bin/python benchmarks/bench_vram.py [--cuda]
+Usage: .venv/bin/python benchmarks/bench_vram.py [--cuda]
 """
 
 import sys
@@ -52,7 +53,7 @@ for S in (4096, 16384, 65536):
             cache.forward(k, v)
             t1 = time.time()
             view = cache.key_cache[0]
-            _ = view.sum().item()          # 强制物化
+            _ = view.sum().item()          # force materialization
             t2 = time.time()
             fill_s, read_s = t1 - t0, t2 - t1
             st = cache.stats(0)

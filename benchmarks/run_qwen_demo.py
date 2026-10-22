@@ -1,11 +1,14 @@
-"""实战测试：Qwen3.5-0.8B（混合线性注意力架构）× flashcodec。
+"""End-to-end test: Qwen3.5-0.8B (hybrid linear attention) x flashcodec.
 
-- PNG keep=1.0 无损档：生成 token 与未打补丁基线逐位完全一致（终极正确性）
-- JPEG k=2/k=4 有损档：文本流畅度、缓存存储比、与基线的 token 一致率
-- 混合架构审计：只有 full_attention 层挂 codec，线性注意力层保留原生层
-用法：python benchmarks/run_qwen_demo.py
-（模型默认 "Qwen/Qwen3.5-0.8B"，从本地 HF 缓存离线加载；可用
- FLASHCODEC_MODEL / FLASHCODEC_NEW_TOKENS 环境变量覆盖）
+- PNG keep=1.0 lossless mode: generated tokens are bitwise-identical to the
+  unpatched baseline (ultimate correctness check)
+- JPEG k=2/k=4 lossy modes: text fluency, cache storage ratio, and token
+  agreement rate against the baseline
+- Hybrid-architecture audit: only full_attention layers get a codec; linear
+  attention layers keep their native layers
+Usage: python benchmarks/run_qwen_demo.py
+(Model defaults to "Qwen/Qwen3.5-0.8B", loaded offline from the local HF cache;
+override with the FLASHCODEC_MODEL / FLASHCODEC_NEW_TOKENS env variables)
 """
 
 import os
@@ -25,7 +28,7 @@ from flashcodec import (FlashCodecCache, apply_flash_codec,
 
 MODEL = os.environ.get("FLASHCODEC_MODEL", "Qwen/Qwen3.5-0.8B")
 NEW = int(os.environ.get("FLASHCODEC_NEW_TOKENS", "48"))
-PROMPT = "杭州的西湖自古以来就是文人墨客向往的地方，"
+PROMPT = "Hangzhou's West Lake has drawn poets and scholars since ancient times, "
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"model={MODEL}  device={device}  new_tokens={NEW}\n")
@@ -52,7 +55,7 @@ def report(tag, out, cache=None):
     if cache is not None:
         n_codec = len(cache.codec_layer_indices())
         st = cache.storage_bytes()
-        # raw 基准：仅 codec 层的完整 KV（B,H,S,D × key+value）
+        # raw baseline: full KV of the codec layers only (B,H,S,D x key+value)
         l0 = cache.layers[cache.codec_layer_indices()[0]]
         raw = n_codec * l0.keys.numel() * l0.keys.element_size() * 2
         print(f"       seq={cache.get_seq_length()} codec_layers={n_codec}/{n_layers} "
@@ -65,14 +68,14 @@ dt = [0.0]
 with warnings.catch_warnings(record=True) as wlist:
     warnings.simplefilter("always")
 
-    # ---- 1) 基线（未打补丁）----
+    # ---- 1) Baseline (unpatched) ----
     t0 = time.time()
     with torch.no_grad():
         ref = model.generate(input_ids=ids, **gen_kw)
     dt[0] = time.time() - t0
     report("baseline", ref)
 
-    # ---- 2) PNG 无损档：逐位一致性（终极正确性检验）----
+    # ---- 2) PNG lossless mode: bitwise identity (ultimate correctness check) ----
     apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
     cache = model._flashcodec["caches"]
     t0 = time.time()
@@ -82,16 +85,16 @@ with warnings.catch_warnings(record=True) as wlist:
     cache = model._flashcodec["caches"][-1]
     report("png keep=1.0", out_png, cache)
     exact = torch.equal(ref, out_png)
-    print(f"       ✅ 生成 token 与基线逐位一致: {exact}"
-          if exact else "       ❌ 生成 token 与基线不一致！")
-    assert exact, "PNG 无损档位应与基线逐位一致"
+    print(f"       ✅ generated tokens bitwise-identical to baseline: {exact}"
+          if exact else "       ❌ generated tokens differ from baseline!")
+    assert exact, "PNG lossless mode must be bitwise-identical to the baseline"
     assert cache.codec_layer_indices() == [
         i for i, t in enumerate(
             model.config.get_text_config().layer_types)
-        if t == "full_attention"], "只有 full_attention 层应挂 codec"
+        if t == "full_attention"], "only full_attention layers should carry a codec"
     remove_flash_codec(model)
 
-    # ---- 3) JPEG 有损档：流畅度 + 存储比 + token 一致率 ----
+    # ---- 3) JPEG lossy mode: fluency + storage ratio + token agreement ----
     for k in (2, 4):
         apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=k)
         t0 = time.time()
@@ -101,13 +104,13 @@ with warnings.catch_warnings(record=True) as wlist:
         cache = model._flashcodec["caches"][-1]
         report(f"jpeg k={k}", out_j, cache)
         same = (out_j == ref).float().mean().item()
-        print(f"       token 一致率 vs 基线: {same:.1%}")
+        print(f"       token agreement vs baseline: {same:.1%}")
         remove_flash_codec(model)
 
 if wlist:
-    print(f"\n⚠️ 捕获到 {len(wlist)} 条警告：")
+    print(f"\n⚠️ captured {len(wlist)} warnings:")
     for w in wlist[:5]:
         print(f"   {w.category.__name__}: {str(w.message)[:120]}")
 else:
-    print("\n零警告 ✅")
+    print("\nZero warnings ✅")
 print("\nDEMO ALL PASS")

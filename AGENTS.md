@@ -1,98 +1,129 @@
 # AGENTS.md — flashcodec
 
-独立开源项目：把 Transformer 时序 KV Cache 张量当"高维多媒体图像信号"压缩
-（jpeg=频域 DCT 有损 / png=时域差分无损）。纯 torch，无 pytest 依赖，
-无 CI。改动前先读完本文件。
+Standalone open-source project: compresses Transformer time-series KV cache tensors
+as "high-dimensional multimedia image signals" (jpeg = frequency-domain DCT lossy /
+png = time-domain delta lossless). Pure torch, no pytest dependency, no CI.
+Read this whole file before making changes.
 
-## 运行约定
+## Running conventions
 
-- **必须从本目录（`flashcodec/`）内运行**：包与项目目录同名，从父目录
-  `import flashcodec` 只会命中命名空间包（没有 `__version__`/导出）——这是
-  同名布局的固有陷阱。`pip install -e .` 后任意位置可导入。
-- 测试是直跑脚本（`assert` + `__main__` 汇总，函数名兼容 pytest）：
-  `python tests/test_jpeg.py`、`python tests/test_png.py`、
-  `python tests/test_causal.py`、`python tests/test_hf_integration.py`。
-  改 codecs/cache 后四组全跑。
-- 基准：`python benchmarks/bench_reconstruct.py`（PSNR/余弦）、
-  `python benchmarks/bench_vram.py [--cuda]`（存储占用/耗时）。
-- 本目录在宿主仓库里被 gitignore——独立 git 仓库，独立发版。
+- **You must run from inside this directory (`flashcodec/`)**: the package and the
+  project directory share a name, so `import flashcodec` from the parent directory
+  only hits the namespace package (no `__version__`/exports) — an inherent trap of
+  this same-name layout. After `pip install -e .` it imports from anywhere.
+- Tests are plain runnable scripts (`assert` + `__main__` summary, function names
+  are pytest-compatible): `python tests/test_jpeg.py`, `python tests/test_png.py`,
+  `python tests/test_causal.py`, `python tests/test_hf_integration.py`.
+  Run all four after touching codecs/cache.
+- Benchmarks: `python benchmarks/bench_reconstruct.py` (PSNR/cosine),
+  `python benchmarks/bench_vram.py [--cuda]` (storage occupancy/timings).
+- This directory is gitignored inside the host repo — it is an independent git
+  repository with independent releases.
 
-## transformers 集成（只适配本机 5.20，4.x 明确不支持）
+## transformers integration (only targets local 5.20; 4.x explicitly unsupported)
 
 - `FlashCodecLayer(DynamicLayer)` + `FlashCodecCache(Cache,
-  layer_class_to_replicate=partial(...))`：5.x 的 Cache 是 layer 容器，
-  基类 `update` 懒建层并下发到 layer；**5.x 注意力直接消费 `update` 的
-  返回值**（不是读 `key_cache`），所以 layer.update 必须返回重构后的
-  完整因果可见 KV。
-- `apply_flash_codec` 主钩子是 `model.generate`（5.x generate 内部自建
-  DynamicCache，只在入口注入才生效）；forward 包装为辅。
-- 生成语义：**cache 长度 = prompt + new_tokens - 1**——末位生成 token 的
-  KV 从不被计算（无人 attend），断言别写成总长。
-- 集成测试陷阱：随机初始化的微模型会误吐 eos 提前停止
-  （`generation_config.eos_token_id = None` 关掉）；lm_head ×20 放大制造
-  明确 argmax 间隔，隔离平局抖动、专注检验缓存机制。
-- `crop`（投机解码路径）：从裁剪后视图重建归档（原型语义）；
-  `offload/prefetch` 为 no-op；beam search（reorder_cache）不支持。
+  layer_class_to_replicate=partial(...))`: 5.x's Cache is a layer container, and
+  the base class lazily creates layers and hands them down to the layer; **5.x
+  attention consumes the return value of `update` directly** (it does not read
+  `key_cache`), so layer.update must return the reconstructed full causally-visible
+  KV.
+- `apply_flash_codec`'s main hook is `model.generate` (5.x generate builds its own
+  DynamicCache internally, so injection only takes effect at the entry point); the
+  forward wrapper is secondary.
+- Generation semantics: **cache length = prompt + new_tokens - 1** — the last
+  generated token's KV is never computed (nobody attends to it), so don't write the
+  assertion as the total length.
+- Integration-test traps: a randomly initialized tiny model will emit eos and stop
+  early (disable it with `generation_config.eos_token_id = None`); scaling lm_head
+  by 20 creates a clear argmax margin, isolating tie jitter and focusing on the
+  cache mechanism.
+- `crop` (speculative decoding path): rebuilds the archive from the cropped view
+  (prototype semantics); `offload/prefetch` are no-ops; beam search
+  (reorder_cache) is unsupported.
 
-## dtype 契约（Qwen3.5-0.8B 实战踩坑总结，改 codecs 前必读）
+## dtype contract (distilled from Qwen3.5-0.8B practice; read before changing codecs)
 
-- **PNG deltas 恒为 fp32**：bf16 输入的差分在 bf16 里算会掉 ~0.4% 精度，
-  cumsum 重建不再逐位精确（bf16 差分在 fp32 中精确可表示，anchor+ΣΔ
-  可逐位还原原值）——这是"无损 → 生成 token 与基线逐位一致"的根据。
-  bf16 部署下归档约 1.9× dense（带宽换精确）。
-- **JPEG coeffs 存输入 dtype**（fp32 计算后 cast）：有损档无需更高精度，
-  且存储比不虚高（k=2 实测 ~27% raw）。
-- **`_CodecStream.read()` 统一还原流输入 dtype**：SDPA 要求 q/k/v 同
-  dtype，fp32 视图喂给 bf16 模型会直接崩。
-- 混合架构（Qwen3.5：18 linear_attention + 6 full_attention）：必须用
-  `FlashCodecCache.from_config(model.config)` 按 layer_types 只给
-  full_attention 层挂 codec，其余层保留原生动态层（递归状态等接口
-  不受影响）；`apply_flash_codec` 已自动走 from_config。
-- 实战脚本：`benchmarks/run_qwen_demo.py`（PNG 无损逐位一致断言 +
-  JPEG 存储比/流畅度报告 + 混合层审计）。
+- **PNG deltas are always fp32**: computing the deltas of bf16 inputs in bf16 loses
+  ~0.4% precision, and cumsum reconstruction is no longer bitwise-exact (bf16
+  deltas are exactly representable in fp32, so anchor+ΣΔ restores the original
+  values bitwise) — this is the basis for "lossless → generated tokens are
+  bitwise-identical to the baseline". Under bf16 deployment the archive is about
+  1.9× dense (bandwidth traded for exactness).
+- **JPEG coeffs are stored in the input dtype** (computed in fp32, then cast):
+  lossy modes need no higher precision, and the storage ratio isn't inflated
+  (k=2 measured ~27% raw).
+- **`_CodecStream.read()` uniformly restores the stream's input dtype**: SDPA
+  requires q/k/v to share a dtype, so feeding fp32 views to a bf16 model crashes
+  outright.
+- Hybrid architecture (Qwen3.5: 18 linear_attention + 6 full_attention): you must
+  use `FlashCodecCache.from_config(model.config)` to attach a codec only to
+  full_attention layers per layer_types, leaving the other layers as native dynamic
+  layers (recursive state and other interfaces are unaffected);
+  `apply_flash_codec` already routes through from_config automatically.
+- Practical script: `benchmarks/run_qwen_demo.py` (PNG lossless bitwise-identity
+  assertion + JPEG storage-ratio/fluency report + hybrid-layer audit).
 
-## 张量契约（改动任何签名前必读）
+## Tensor contract (read before changing any signature)
 
-- KV 布局 `(B, H, S, D)`；**压缩/滤波操作轴恒为 dim=-2（seq 轴）**。
-- codecs 内只允许批量矩阵乘/逐元素算子，**禁止显式 Python for 循环**；
-  尾部不足块用零填充（`_pad_to_blocks`），`out_len` 裁回。
-- codecs 统一 fp32 计算（`dct_compress` 等内部 `.float()`）；keep=r 的
-  DCT 与 keep_ratio=1 的 PNG 是"无损"基线（fp 往返 ~1e-6/1e-7 级，
-  断言容差见测试，别收紧到逐位）。
+- KV layout `(B, H, S, D)`; **the compression/filtering axis is always dim=-2 (the
+  seq axis)**.
+- Codecs may only use batched matmul/elementwise operators; **explicit Python for
+  loops are forbidden**; the trailing partial block is zero-padded
+  (`_pad_to_blocks`) and trimmed back via `out_len`.
+- Codecs compute in fp32 uniformly (`dct_compress` and friends call `.float()`
+  internally); DCT with keep=r and PNG with keep_ratio=1 are the "lossless"
+  baselines (fp round-trip on the ~1e-6/1e-7 level; see the tests for assertion
+  tolerances, and don't tighten them to bitwise).
 
-## 因果安全不变量（破坏即 bug）
+## Causal-safety invariants (breaking these is a bug)
 
-1. **只归档完整块**；未满块永远留 `raw_buffer`（原始精度）——增量解码
-   任意时刻的未来扰动不得改写已归档张量（`test_causal` 逐位验证）。
-2. 全量 `forward(seq)` 与逐步 `decode_step` 两条填充路径产生的归档与
-   视图必须**逐位一致**（两条路径写入同一块倍增存储、共用同一单次解码，
-   天然对称；改成分片结构前先想清楚这条）。
-3. `mode="png", keep_ratio=1.0` 无损档位下，逐步解码注意力必须与全量
-   前向对齐 ≤1e-4（测试的正确性锚点）。
+1. **Archive complete blocks only**; an incomplete block always stays in
+   `raw_buffer` (original precision) — a future perturbation at any point during
+   incremental decoding must never rewrite already-archived tensors (`test_causal`
+   verifies this bitwise).
+2. The archives and views produced by the two fill paths — full `forward(seq)` and
+   stepwise `decode_step` — must be **bitwise-identical** (both paths write into the
+   same capacity-doubling storage and share a single decode pass, so they are
+   inherently symmetric; think this through before switching to a sharded
+   structure).
+3. In the `mode="png", keep_ratio=1.0` lossless mode, stepwise decoding attention
+   must align with the full forward pass within ≤1e-4 (the tests' correctness
+   anchor).
 
-## 设计决策（别"顺手重构"掉）
+## Design decisions (don't "refactor these away" in passing)
 
-- **HF 热补丁在 Cache 层而非注意力内核**：标准 HF 模型的 KV 写入/读取
-  统一收敛在 Cache 接口（`update`/`key_cache`），`CodecKVCache` 鸭子类型
-  注入即可，比逐模型手术（GQA/MQA/RoPE 变体）鲁棒得多。
-- **PNG 稠密存储如实计 1.0**：锚点+差分与原始块等大；省的是信息熵
- （方差压缩 ~30×），压缩空间留给熵编码器——`storage_ratio()` 不许"四舍
-  五入"成 (r-1)/r。
-- 全量 `forward(seq)` 预填会把完整块直接压缩，块内位置注意力看到块级
-  重构（块内近似）；增量路径无此问题。这是已文档化的语义，不是 bug。
-- 归档数据结构：**倍增预分配单张量**（std::vector 式，初始 16 块、装满
-  翻倍）——jpeg 是 `_coeffs (B,H,capacity,k,D)`；png 是
-  `_deltas (B,H,capacity,r-1,D) fp32 + _anchors (B,H,capacity,D)`。
-  每满块只做原地切片写入；`read()` 对有效区单次解码 + cat raw 尾。
-  **不要**改回"每满块 append 一个新归档张量 + read 逐归档循环"——碎片化
-  逐 token 解码实测 read 慢 170×（S=4096 时 31ms → 0.18ms，launch 开销
-  主导）。`storage_bytes()` 只计逻辑有效区，不含倍增预留的空闲容量。
-  `reset()` 清零计数但**保留已分配容量**（crop/重填复用显存）。
+- **The HF hot patch lives in the Cache layer, not the attention kernel**: KV
+  writes/reads in standard HF models converge on the Cache interface
+  (`update`/`key_cache`), so injecting a `CodecKVCache` duck type is enough — far
+  more robust than per-model surgery (GQA/MQA/RoPE variants).
+- **PNG dense storage honestly counts as 1.0**: anchor+deltas are the same size as
+  the original block; what it saves is information entropy (variance compression
+  ~30×), and that headroom is left to an entropy coder — `storage_ratio()` must not
+  "round" this into (r-1)/r.
+- A full `forward(seq)` prefill compresses complete blocks directly, so in-block
+  position attention sees the block-level reconstruction (intra-block
+  approximation); the incremental path has no such issue. This is documented
+  semantics, not a bug.
+- Archive data structure: **a capacity-doubling preallocated single tensor**
+  (std::vector style, starting at 16 blocks, doubling when full) — jpeg uses
+  `_coeffs (B,H,capacity,k,D)`; png uses `_deltas (B,H,capacity,r-1,D) fp32 +
+  _anchors (B,H,capacity,D)`. Each full block only does an in-place slice write;
+  `read()` single-decodes the valid region + cats the raw tail.
+  **Do not** revert to "append a new archive tensor per full block + loop over
+  archives in read" — with that fragmentation, per-token decoding measured 170×
+  slower reads (31ms → 0.18ms at S=4096, launch overhead dominating).
+  `storage_bytes()` only counts the logical valid region, not the free capacity
+  reserved by doubling. `reset()` zeroes the counters but **retains allocated
+  capacity** (reused for crop/refill VRAM).
 
-## 发版
+## Release
 
-- `pyproject.toml`（setuptools，MIT，torch>=2.0），版本号在
-  `pyproject.toml` 与 `flashcodec/__init__.py::__version__` 双写，改一处
-  必须同步另一处。
-- 发 PyPI 前必跑三组测试 + 两个基准（README 里的实测表要随之更新——
-  README 的数字都是真实跑出来的，不许留占位或过期数据）。
+- `images/` holds the README screenshots and is maintained by the user — do not
+  regenerate, replace, or commit new images unless explicitly asked.
+- `pyproject.toml` (setuptools, MIT, torch>=2.0); the version number is written in
+  both `pyproject.toml` and `flashcodec/__init__.py::__version__`, so changing one
+  requires syncing the other.
+- Before publishing to PyPI, run all three test groups + both benchmarks (the
+  measured tables in the README must be updated accordingly — every number in the
+  README was actually measured; no placeholders or stale data).

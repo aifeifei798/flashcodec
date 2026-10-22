@@ -1,66 +1,72 @@
-"""统一编解码 KV Cache 管理器。
+"""Unified codec KV cache manager.
 
-设计：
-- 每条 KV 流（key/value × layer）内部维护
-  ``raw_buffer``（未满一个块的尾部 token，保持原始高保真）与
-  ``compressed_storage``（完成块的压缩归档：jpeg 存低频系数 / png 存
-  锚点+差分）；
-- 一旦累积满 block_size 个 token，触发批量归档压缩（一次 GEMM，无循环）；
-- 因果安全：只归档"完整块"，当前未满块永远是 raw——增量解码时任意时刻
-  的未来扰动都不会改写已归档张量；
-- 双接口：``forward(key_seq, value_seq)`` 全量分块平铺；
-  ``decode_step(new_k, new_v)`` 单步追加、跨块边界自动归档；
-- 鸭子类型兼容 HuggingFace ``Cache``（update / get_seq_length /
-  key_cache / value_cache），可直接注入 generate 流程。
+Design:
+- Each KV stream (key/value x layer) keeps internally a ``raw_buffer``
+  (tail tokens that do not fill a full block, held at full fidelity) and a
+  ``compressed_storage`` (compressed archive of completed blocks: jpeg keeps
+  low-frequency coefficients / png keeps anchors + deltas);
+- Once block_size tokens have accumulated, batched archive compression is
+  triggered (a single GEMM, no loops);
+- Causal safety: only "complete blocks" are archived, the current partial
+  block always stays raw — future perturbations at any point of incremental
+  decoding never rewrite already-archived tensors;
+- Dual interface: ``forward(key_seq, value_seq)`` tiles the full sequence
+  block by block; ``decode_step(new_k, new_v)`` appends a single step and
+  archives automatically across block boundaries;
+- Duck-typed compatible with HuggingFace ``Cache`` (update / get_seq_length /
+  key_cache / value_cache), so it can be injected directly into generate.
 
-张量契约：KV 布局 (batch, num_heads, seq_len, head_dim)，压缩轴 dim=-2。
+Tensor contract: KV layout (batch, num_heads, seq_len, head_dim), compression
+axis dim=-2.
 """
 
 import torch
 
 from .codecs import JPEGCodec, PNGCodec, dct_decompress, png_reconstruct
 
-try:  # transformers 5.x 原生 Cache 生态（layer 容器模式）
+try:  # native transformers 5.x Cache ecosystem (layer container mode)
     from functools import partial
 
     from transformers.cache_utils import Cache as _HFCache
     from transformers.cache_utils import DynamicLayer as _HFDynamicLayer
     HAS_HF_CACHE = True
-except Exception:                                    # 未安装 transformers 时保底
+except Exception:                          # fallback when transformers is absent
     _HFCache = object
     _HFDynamicLayer = object
     HAS_HF_CACHE = False
 
 
 def make_codec(mode="jpeg", block_size=8, keep_freqs=2, keep_ratio=1.0):
-    """按模式名构造编解码器实例。"""
+    """Build a codec instance from a mode name."""
     if mode == "jpeg":
         return JPEGCodec(block_size=block_size, keep_freqs=keep_freqs)
     if mode == "png":
         return PNGCodec(block_size=block_size, keep_ratio=keep_ratio)
-    raise ValueError(f"未知 mode: {mode!r}（可选 'jpeg' | 'png'）")
+    raise ValueError(f"unknown mode: {mode!r} (expected 'jpeg' | 'png')")
 
 
 class _CodecStream:
-    """单条 (B,H,S,D) 流：raw 尾巴 + 倍增预分配的压缩归档。
+    """Single (B,H,S,D) stream: raw tail + capacity-doubling preallocated archive.
 
-    归档存储采用 std::vector 式几何倍增预分配（初始 16 块，装满翻倍）：
-    每满块只做一次原地切片写入（无重新分配），read() 对有效区做单次
-    大 GEMM / cumsum——彻底消灭逐归档 Python 循环与碎片 kernel 发射。
-    jpeg: ``_coeffs (B,H,capacity,k,D)``（输入 dtype）；
-    png:  ``_deltas (B,H,capacity,r-1,D)``（fp32）+ ``_anchors (B,H,capacity,D)``。
+    Archive storage uses std::vector-style geometric capacity doubling
+    (starting at 16 blocks, doubling when full): each full block is written
+    once as an in-place slice (no reallocation), and read() runs a single
+    large GEMM / cumsum over the valid region — eliminating per-archive
+    Python loops and fragmented kernel launches entirely.
+    jpeg: ``_coeffs (B,H,capacity,k,D)`` (input dtype);
+    png:  ``_deltas (B,H,capacity,r-1,D)`` (fp32) + ``_anchors (B,H,capacity,D)``.
     """
 
     _INITIAL_BLOCKS = 16
 
     def __init__(self, codec):
         self.codec = codec
-        self.raw = None          # (B,H,t,D)，t < block_size
-        self.n_archived = 0      # 已归档 token 总数
-        self.n_blocks = 0        # 归档区已用块数
+        self.raw = None          # (B,H,t,D), t < block_size
+        self.n_archived = 0      # total number of archived tokens
+        self.n_blocks = 0        # blocks used in the archive region
         self.meta = None         # (B, H, D, elem_size)
-        self.dtype = None        # 流输入 dtype（读取统一还原，SDPA dtype 契约）
-        self._capacity = 0       # 归档区已分配块数（几何倍增）
+        self.dtype = None        # stream input dtype (restored; SDPA dtype contract)
+        self._capacity = 0       # blocks allocated in the archive (geometric growth)
         self._coeffs = None      # jpeg: (B,H,capacity,k,D)
         self._deltas = None      # png:  (B,H,capacity,r-1,D) fp32
         self._anchors = None     # png:  (B,H,capacity,D)
@@ -70,7 +76,8 @@ class _CodecStream:
         return self.codec.block_size
 
     def _grow(self, need_blocks, like):
-        """几何倍增扩容：容量不足时翻倍到 ≥ need_blocks，旧数据原样拷入。"""
+        """Geometric growth: when capacity is insufficient, double until
+        >= need_blocks and copy the old data over verbatim."""
         if need_blocks <= self._capacity:
             return
         cap = max(self._INITIAL_BLOCKS, 1)
@@ -96,7 +103,8 @@ class _CodecStream:
         self._capacity = cap
 
     def _archive(self, head):
-        """把满块 head (..., n_full*r, D) 压缩写入归档区（原地切片）。"""
+        """Compress full blocks head (..., n_full*r, D) into the archive
+        region (in-place slice)."""
         n_full = head.shape[-2] // self.block_size
         self._grow(self.n_blocks + n_full, head)
         sl = slice(self.n_blocks, self.n_blocks + n_full)
@@ -109,12 +117,13 @@ class _CodecStream:
         self.n_blocks += n_full
 
     def append(self, tokens):
-        """追加 (B,H,m,D)；满块即批量压缩写入归档区（一次批量 GEMM）。"""
+        """Append (B,H,m,D); full blocks are batch-compressed into the archive
+        immediately (a single batched GEMM)."""
         r = self.block_size
         if self.meta is None:
             self.meta = (tokens.shape[0], tokens.shape[1], tokens.shape[-1],
                          tokens.element_size())
-            self.dtype = tokens.dtype        # 归档/读取统一回输入 dtype
+            self.dtype = tokens.dtype        # archive/read restore the input dtype
         buf = tokens if self.raw is None else torch.cat(
             [self.raw, tokens], dim=-2)
         total = buf.shape[-2]
@@ -126,8 +135,10 @@ class _CodecStream:
                     if total > n_full * r else None)
 
     def read(self):
-        """重构视图 (B,H,S,D)：有效归档区单次解码 + raw 尾巴拼接。
-        统一还原到流输入 dtype（注意力 q/k/v 的 dtype 契约）。"""
+        """Reconstructed view (B,H,S,D): a single decode of the valid archive
+        region + concatenation of the raw tail.
+        Everything is restored to the stream input dtype (attention q/k/v dtype
+        contract)."""
         if self.n_blocks == 0:
             return self.raw
         if self.codec.name == "jpeg":
@@ -143,7 +154,8 @@ class _CodecStream:
         return rec
 
     def reset(self):
-        """清零内容但保留容量：crop / 重填复用已分配显存，不再反复申请。"""
+        """Zero the contents but keep the capacity: crop / refill reuse the
+        allocated VRAM instead of re-allocating it over and over."""
         self.raw = None
         self.n_archived = 0
         self.n_blocks = 0
@@ -153,7 +165,8 @@ class _CodecStream:
         return self.n_archived + (0 if self.raw is None else self.raw.shape[-2])
 
     def storage_bytes(self):
-        """逻辑存储（有效区 + raw 尾），不含倍增预留的空闲容量。"""
+        """Logical storage (valid region + raw tail), excluding the idle
+        capacity reserved by the doubling preallocation."""
         total = 0
         if self.n_blocks:
             view = (self._coeffs if self.codec.name == "jpeg"
@@ -168,13 +181,13 @@ class _CodecStream:
 
 
 class CodecKVCache:
-    """编解码 KV Cache（多 layer，HF Cache 鸭子类型）。
+    """Codec KV cache (multi-layer, duck-typed as an HF Cache).
 
-    用法::
+    Usage::
 
         cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
-        k, v = cache.update(k_states, v_states, layer_idx=0)   # 增量
-        k, v = cache.forward(k_seq, v_seq, layer_idx=0)        # 全量
+        k, v = cache.update(k_states, v_states, layer_idx=0)   # incremental
+        k, v = cache.forward(k_seq, v_seq, layer_idx=0)        # full sequence
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
@@ -184,7 +197,7 @@ class CodecKVCache:
         self._keys = {}
         self._values = {}
 
-    # ---------- 内部 ----------
+    # ---------- internals ----------
     def _stream(self, store, layer_idx):
         st = store.get(layer_idx)
         if st is None:
@@ -192,10 +205,11 @@ class CodecKVCache:
             store[layer_idx] = st
         return st
 
-    # ---------- 双接口 ----------
+    # ---------- dual interface ----------
     def update(self, key_states, value_states, layer_idx=0):
-        """增量自回归接口：追加新 (B,H,m,D)，跨块边界自动压缩归档；
-        返回该层重构后的 (key_view, value_view)。"""
+        """Incremental autoregressive interface: append new (B,H,m,D) and
+        archive automatically across block boundaries; returns the layer's
+        reconstructed (key_view, value_view)."""
         self._stream(self._keys, layer_idx).append(key_states)
         self._stream(self._values, layer_idx).append(value_states)
         return (self._keys[layer_idx].read(),
@@ -204,8 +218,9 @@ class CodecKVCache:
     decode_step = update
 
     def forward(self, key_seq, value_seq, layer_idx=0):
-        """全量前向接口：在序列维度直接分块平铺（重置该层后一次性填充），
-        返回重构后的 (key_view, value_view)。"""
+        """Full-sequence forward interface: tile the sequence dimension block
+        by block directly (reset the layer, then fill it in one shot); returns
+        the reconstructed (key_view, value_view)."""
         self.reset(layer_idx)
         return self.update(key_seq, value_seq, layer_idx)
 
@@ -217,7 +232,7 @@ class CodecKVCache:
             self._keys.pop(layer_idx, None)
             self._values.pop(layer_idx, None)
 
-    # ---------- HF Cache 鸭子类型 ----------
+    # ---------- HF Cache duck typing ----------
     @property
     def key_cache(self):
         mx = max(self._keys, default=-1)
@@ -235,12 +250,12 @@ class CodecKVCache:
         return 0 if st is None else st.seq_len
 
     def get_max_length(self):
-        return None                     # 无上限
+        return None                     # no upper bound
 
     def get_usable_length(self, new_seq_length, layer_idx=0):
         return self.get_seq_length(layer_idx)
 
-    # ---------- 诊断 ----------
+    # ---------- diagnostics ----------
     def storage_bytes(self, layer_idx=None):
         layers = ([layer_idx] if layer_idx is not None
                   else sorted(set(self._keys) | set(self._values)))
@@ -266,12 +281,14 @@ class CodecKVCache:
 
 
 # ============================================================
-# transformers 5.x 原生 Cache 后端（layer 容器模式）
+# transformers 5.x native Cache backend (layer container mode)
 # ============================================================
 class FlashCodecLayer(_HFDynamicLayer):
-    """transformers 5.x CacheLayer：把 DynamicLayer 的 cat 式增长替换为
-    编解码流（raw 尾 + 满块归档）。update 返回重构后的完整因果可见 KV，
-    供注意力层直接使用——写入与读取的替换收敛在这一层，模型零手术。"""
+    """transformers 5.x CacheLayer: replaces DynamicLayer's cat-style growth
+    with a codec stream (raw tail + archived full blocks). update returns the
+    reconstructed, causally visible KV for the attention layer to consume
+    directly — the write and read replacements are both contained in this
+    layer, requiring zero model surgery."""
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
                  keep_ratio=1.0):
@@ -301,13 +318,15 @@ class FlashCodecLayer(_HFDynamicLayer):
         return self._key_stream.seq_len
 
     def get_max_length(self):
-        return -1                            # 动态缓存无上限
+        return -1                            # dynamic cache, no upper bound
 
     def crop(self, tokens_to_remove):
-        """投机解码等路径会裁剪缓存：从裁剪后的重构视图重建归档
- （原型语义：重建会把已压缩部分重新过滤一遍）。"""
+        """Speculative decoding and similar paths crop the cache: rebuild the
+        archive from the cropped reconstructed view (prototype semantics:
+        rebuilding filters the already-compressed part once more)."""
         if tokens_to_remove > 0:
-            raise ValueError("crop 只支持负值（移除末尾 token）")
+            raise ValueError("crop only supports negative values "
+                             "(remove trailing tokens)")
         if tokens_to_remove == 0:
             return
         self._key_stream.reset()
@@ -324,7 +343,7 @@ class FlashCodecLayer(_HFDynamicLayer):
         super().reset()
 
     def offload(self):
-        pass                               # 原型不支持层卸载（流式归档在 CPU 外）
+        pass                     # prototype has no layer offload (archives are off-CPU)
 
     def prefetch(self):
         pass
@@ -335,24 +354,27 @@ class FlashCodecLayer(_HFDynamicLayer):
 
 
 class FlashCodecCache(_HFCache):
-    """transformers 5.x 原生编解码 KV Cache（第一等公民后端）。
+    """transformers 5.x native codec KV cache (first-class backend).
 
-    用法一（显式传参）::
+    Usage 1 (explicit)::
 
         cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)
         model.generate(input_ids, past_key_values=cache, use_cache=True)
 
-    用法二（apply_flash_codec 热补丁自动注入）。
-    基类 Cache 以 layer_class_to_replicate 懒建层，update 直接下发到
-    FlashCodecLayer；get_seq_length / get_max_length / crop 等继承即用。
+    Usage 2 (automatic injection via the apply_flash_codec hot patch).
+    The Cache base class lazily creates layers through
+    layer_class_to_replicate and forwards update to FlashCodecLayer;
+    get_seq_length / get_max_length / crop and friends come for free by
+    inheritance.
     """
 
     def __init__(self, mode="jpeg", block_size=8, keep_freqs=2,
                  keep_ratio=1.0):
         if not HAS_HF_CACHE:
             raise ImportError(
-                "FlashCodecCache 需要 transformers 5.x（本项目仅适配当前安装的 "
-                "5.20 Cache 生态）；无 transformers 时请使用 CodecKVCache。")
+                "FlashCodecCache requires transformers 5.x (this project only "
+                "supports the installed 5.20 Cache ecosystem); use "
+                "CodecKVCache when transformers is unavailable.")
         super().__init__(
             layers=None,
             layer_class_to_replicate=partial(
@@ -364,23 +386,26 @@ class FlashCodecCache(_HFCache):
 
     @property
     def _seen_tokens(self):
-        """旧版 transformers 习惯的计数器属性（5.x 内部已不用，保留兼容）。"""
+        """Counter attribute familiar from older transformers versions (unused
+        internally by 5.x, kept for compatibility)."""
         return self.get_seq_length()
 
     @classmethod
     def from_config(cls, config, mode="jpeg", block_size=8, keep_freqs=2,
                     keep_ratio=1.0):
-        """按模型 config 构建混合层列表（Qwen3.5 等混合架构）：
-        只有 full_attention 层挂 codec 层，其余层类型（linear_attention/
-        sliding 等）保留原生动态层——与 DynamicCache(config=...) 的分发
-        一致，线性注意力的递归状态等原生接口不受影响。"""
+        """Build the mixed-layer list from the model config (Qwen3.5-style
+        hybrid architectures): only full_attention layers get a codec layer,
+        while the remaining layer types (linear_attention / sliding, etc.)
+        keep their native dynamic layer — consistent with how
+        DynamicCache(config=...) dispatches, so native interfaces such as
+        linear-attention recurrent state stay unaffected."""
         from transformers.cache_utils import (DYNAMIC_LAYER_TYPE_MAPPING,
                                               get_layer_types_and_kwargs)
         decoder = (config.get_text_config(decoder=True)
                    if hasattr(config, "get_text_config") else config)
         try:
             layer_types, per_layer_kwargs = get_layer_types_and_kwargs(decoder)
-        except Exception:                        # 老式 config 无 per_layer_config
+        except Exception:                        # legacy config, no per_layer_config
             layer_types = list(getattr(decoder, "layer_types",
                                        ["full_attention"] *
                                        getattr(decoder, "num_hidden_layers", 1)))
@@ -401,18 +426,21 @@ class FlashCodecCache(_HFCache):
         return obj
 
     def codec_layer_indices(self):
-        """真正挂了编解码的层下标（混合架构中即 full_attention 层）。"""
+        """Indices of the layers that actually carry a codec (i.e. the
+        full_attention layers in hybrid architectures)."""
         return [i for i, layer in enumerate(self.layers)
                 if isinstance(layer, FlashCodecLayer)]
 
     def to_legacy_cache(self):
-        """导出为 {layer_idx: (keys, values)} 旧格式（重构后的完整视图）。"""
+        """Export to the legacy {layer_idx: (keys, values)} format
+        (reconstructed full views)."""
         return {i: (layer.keys, layer.values)
                 for i, layer in enumerate(self.layers)}
 
     @classmethod
     def from_legacy_cache(cls, legacy, **cfg):
-        """从旧格式 {(layer_idx): (k, v)} 重建（整段重走过一遍编解码）。"""
+        """Rebuild from the legacy {(layer_idx): (k, v)} format (the whole
+        span goes through the codec once more)."""
         cache = cls(**cfg)
         for layer_idx in sorted(legacy):
             k, v = legacy[layer_idx]

@@ -1,14 +1,16 @@
-"""Qwen3.5-0.8B × flashcodec 互动网页 Chat（零第三方 Web 依赖，纯 stdlib）。
+"""Qwen3.5-0.8B × flashcodec interactive web chat (zero third-party web deps, pure stdlib).
 
-用法：python demo/qwen_webchat.py   →   http://127.0.0.1:7860
-环境变量：FLASHCODEC_MODEL（默认 Qwen/Qwen3.5-0.8B）、WEBCHAT_HOST、
-WEBCHAT_PORT、WEBCHAT_NEW_TOKENS（默认 256）。
+Usage: python demo/qwen_webchat.py   →   http://127.0.0.1:7860
+Environment variables: FLASHCODEC_MODEL (default Qwen/Qwen3.5-0.8B), WEBCHAT_HOST,
+WEBCHAT_PORT, WEBCHAT_NEW_TOKENS (default 256).
 
-功能：
-- 模式切换：baseline（原生）/ png keep=1.0（无损）/ jpeg k=1,2,4（有损）
-- 逐 token 流式输出；每次请求走 apply_flash_codec 真实用户路径
-- 统计面板：codec 层数、缓存存储 vs raw、压缩比、KV 序列长、tok/s
-- 一致性校验：同 prompt 分别跑 baseline 与 png 无损，断言生成 token 逐位一致
+Features:
+- Mode switching: baseline (native) / png keep=1.0 (lossless) / jpeg k=1,2,4 (lossy)
+- Token-by-token streaming; every request goes through apply_flash_codec, the real user path
+- Stats panel: codec layer count, cache storage vs raw, compression ratio, KV sequence
+  length, tok/s
+- Consistency check: run baseline and png lossless separately on the same prompt and
+  assert the generated tokens are bitwise-identical
 """
 
 import json
@@ -42,7 +44,7 @@ MODES = {
 }
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"加载 {MODEL}（{device}）...")
+print(f"Loading {MODEL} ({device})...")
 tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
 _dtype = torch.bfloat16 if device == "cuda" else torch.float32
 try:
@@ -53,9 +55,9 @@ except Exception:
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL, local_files_only=True, dtype=_dtype)
 model = model.to(device).eval()
-print("就绪 ✅")
+print("Ready ✅")
 
-gpu_lock = threading.Lock()          # 单卡串行化请求
+gpu_lock = threading.Lock()          # serialize requests on a single GPU
 
 
 def apply_mode(key):
@@ -65,7 +67,7 @@ def apply_mode(key):
 
 
 def cache_stats(elapsed, n_new):
-    """收集本次生成的缓存统计（patch 注入的 cache 保存在诊断槽里）。"""
+    """Collect cache stats for this generation (the patch-injected cache lives in the diagnostics slot)."""
     info = getattr(model, "_flashcodec", None)
     cache = info["caches"][-1] if info and info["caches"] else None
     if cache is None or not cache.layers:
@@ -85,7 +87,7 @@ def cache_stats(elapsed, n_new):
 
 
 def chat_stream(messages, mode):
-    """流式生成：apply_flash_codec 注入 + TextIteratorStreamer 逐 token。"""
+    """Stream generation: apply_flash_codec injection + TextIteratorStreamer token by token."""
     prompt = tok.apply_chat_template(messages, tokenize=False,
                                      add_generation_prompt=True)
     ids = tok(prompt, return_tensors="pt").input_ids.to(device)
@@ -113,7 +115,7 @@ def chat_stream(messages, mode):
 
 
 def verify_pair(messages, mode="png_lossless", n_new=48):
-    """一致性校验：baseline 与所选档位各跑一次贪心，比较生成 token。"""
+    """Consistency check: run baseline and the selected mode greedily once each and compare tokens."""
     prompt = tok.apply_chat_template(messages, tokenize=False,
                                      add_generation_prompt=True)
     ids = tok(prompt, return_tensors="pt").input_ids.to(device)
@@ -143,7 +145,7 @@ def verify_pair(messages, mode="png_lossless", n_new=48):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *args):                     # 静默访问日志
+    def log_message(self, *args):                     # silence access logs
         pass
 
     def _json(self, obj, code=200):
@@ -186,20 +188,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         messages = payload.get("messages") or []
         if not messages:
-            self._json({"error": "messages 为空"}, 400)
+            self._json({"error": "messages must not be empty"}, 400)
             return
 
         if self.path == "/api/chat":
             mode = payload.get("mode", "baseline")
             if mode not in MODES:
-                self._json({"error": f"未知模式 {mode}"}, 400)
+                self._json({"error": f"unknown mode {mode}"}, 400)
                 return
             with gpu_lock:
                 self._sse_start()
                 try:
                     for event in chat_stream(messages, mode):
                         self._sse(event)
-                except Exception as e:                # 服务不因单次请求崩溃
+                except Exception as e:                # a single request must not crash the server
                     self._sse({"type": "error", "text": repr(e)})
         elif self.path == "/api/verify":
             mode = payload.get("mode", "png_lossless")
@@ -213,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 PAGE = r"""<!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -262,28 +264,28 @@ PAGE = r"""<!doctype html>
 <div class="wrap">
   <header>
     <h1>flashcodec × Qwen3.5-0.8B</h1>
-    <span class="tag">KV Cache: JPEG 频域 / PNG 差分</span>
+    <span class="tag">KV cache: JPEG frequency-domain / PNG delta</span>
     <span class="tag" id="mdl"></span>
   </header>
 
   <div class="ctl">
-    <label>编码档位</label>
+    <label>Codec mode</label>
     <select id="mode">
-      <option value="baseline">baseline（原生，无压缩）</option>
-      <option value="png_lossless" selected>png keep=1.0（无损，逐位一致）</option>
-      <option value="jpeg_k1">jpeg k=1（8× 有损）</option>
-      <option value="jpeg_k2">jpeg k=2（4× 有损）</option>
-      <option value="jpeg_k4">jpeg k=4（2× 有损）</option>
+      <option value="baseline">baseline (native, no compression)</option>
+      <option value="png_lossless" selected>png keep=1.0 (lossless, bitwise-identical)</option>
+      <option value="jpeg_k1">jpeg k=1 (8× lossy)</option>
+      <option value="jpeg_k2">jpeg k=2 (4× lossy)</option>
+      <option value="jpeg_k4">jpeg k=4 (2× lossy)</option>
     </select>
-    <button id="verify">无损一致性校验</button>
-    <button id="clear">清空对话</button>
+    <button id="verify">Verify lossless match</button>
+    <button id="clear">Clear chat</button>
   </div>
 
   <div id="chat"></div>
 
-  <textarea id="input" placeholder="输入消息，Enter 发送（Shift+Enter 换行）"></textarea>
+  <textarea id="input" placeholder="Type a message, Enter to send (Shift+Enter for a newline)"></textarea>
   <div class="row">
-    <button id="send">发 送</button>
+    <button id="send">Send</button>
     <span id="status"></span>
   </div>
 </div>
@@ -304,7 +306,7 @@ function scroll() { chatEl.scrollTop = chatEl.scrollHeight; }
 function addMsg(role, text) {
   const div = document.createElement('div');
   div.className = 'msg ' + (role === 'user' ? 'user' : 'ai');
-  div.innerHTML = `<div><div class="who">${role === 'user' ? '你' : 'Qwen3.5 + flashcodec'}</div>` +
+  div.innerHTML = `<div><div class="who">${role === 'user' ? 'You' : 'Qwen3.5 + flashcodec'}</div>` +
                   `<div class="bubble"></div></div>`;
   div.querySelector('.bubble').textContent = text;
   chatEl.appendChild(div); scroll();
@@ -317,12 +319,12 @@ function fmtBytes(b) {
 }
 
 function statsHtml(s) {
-  const parts = [`codec 层 <b>${s.codec_layers}</b>`,
-                 `存储 <b>${fmtBytes(s.storage)}</b>`];
+  const parts = [`codec layers <b>${s.codec_layers}</b>`,
+                 `storage <b>${fmtBytes(s.storage)}</b>`];
   if (s.ratio != null)
-    parts.push(`vs raw <b>${fmtBytes(s.raw)}</b>（<b>${(s.ratio*100).toFixed(1)}%</b>）`);
-  if (s.kv_len != null) parts.push(`KV 长 <b>${s.kv_len}</b>`);
-  parts.push(`速度 <b>${s.tok_s}</b> tok/s`);
+    parts.push(`vs raw <b>${fmtBytes(s.raw)}</b> (<b>${(s.ratio*100).toFixed(1)}%</b>)`);
+  if (s.kv_len != null) parts.push(`KV length <b>${s.kv_len}</b>`);
+  parts.push(`speed <b>${s.tok_s}</b> tok/s`);
   return `<div class="stats">${parts.map(p => `<span>${p}</span>`).join('')}</div>`;
 }
 
@@ -331,7 +333,7 @@ async function send() {
   const text = inputEl.value.trim();
   if (!text) return;
   busy = true; sendBtn.disabled = true;
-  inputEl.value = ''; statusEl.textContent = '生成中…';
+  inputEl.value = ''; statusEl.textContent = 'Generating…';
   addMsg('user', text);
   history.push({ role: 'user', content: text });
   const bubble = addMsg('ai', '');
@@ -356,22 +358,22 @@ async function send() {
         const ev = JSON.parse(raw.slice(6));
         if (ev.type === 'token') { acc += ev.text; bubble.textContent = acc; scroll(); }
         else if (ev.type === 'stats') { bubble.parentElement.insertAdjacentHTML('beforeend', statsHtml(ev)); scroll(); }
-        else if (ev.type === 'error') { statusEl.textContent = '错误：' + ev.text; }
+        else if (ev.type === 'error') { statusEl.textContent = 'Error: ' + ev.text; }
       }
     }
     history.push({ role: 'assistant', content: acc });
     statusEl.textContent = '';
   } catch (e) {
-    statusEl.textContent = '请求失败：' + e;
+    statusEl.textContent = 'Request failed: ' + e;
   }
   busy = false; sendBtn.disabled = false; inputEl.focus();
 }
 
 async function verify() {
   if (busy) return;
-  const text = inputEl.value.trim() || '介绍一下西湖。';
+  const text = inputEl.value.trim() || 'Tell me about West Lake.';
   busy = true; verifyBtn.disabled = true;
-  statusEl.textContent = '校验中（同 prompt 跑 baseline 与 png 无损各一次）…';
+  statusEl.textContent = 'Verifying (running baseline and png lossless once each on the same prompt)…';
   try {
     const resp = await fetch('/api/verify', {
       method: 'POST',
@@ -384,30 +386,30 @@ async function verify() {
     div.className = 'msg ai';
     const cls = r.exact ? 'ok' : 'bad';
     const verdict = r.exact
-      ? '✅ 一致：PNG 无损档生成 token 与 baseline 逐位完全相同'
-      : '❌ 不一致：出现 token 分歧（请反馈此场景）';
-    div.innerHTML = `<div><div class="who">一致性校验 · ${text}</div>` +
+      ? '✅ Match: the PNG lossless mode generated tokens bitwise-identical to the baseline'
+      : '❌ Mismatch: token divergence detected (please report this case)';
+    div.innerHTML = `<div><div class="who">Consistency check · ${text}</div>` +
       `<div class="bubble"><span class="${cls}">${verdict}</span>\n` +
       `baseline : ${r.base_text}\ncodec    : ${r.codec_text}</div>` +
       statsHtml(r.stats) + `</div>`;
     chatEl.appendChild(div); scroll();
     statusEl.textContent = '';
   } catch (e) {
-    statusEl.textContent = '校验失败：' + e;
+    statusEl.textContent = 'Verification failed: ' + e;
   }
   busy = false; verifyBtn.disabled = false;
 }
 
 sendBtn.onclick = send;
 verifyBtn.onclick = verify;
-clearBtn.onclick = () => { history = []; chatEl.innerHTML = ''; statusEl.textContent = '已清空（服务端缓存随下次生成重建）'; };
+clearBtn.onclick = () => { history = []; chatEl.innerHTML = ''; statusEl.textContent = 'Cleared (the server-side cache is rebuilt on the next generation)'; };
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
 document.getElementById('mdl').textContent =
-  '贪心解码 · 每轮独立 prefill';
-addMsg('ai', '你好！我是 Qwen3.5-0.8B，KV Cache 由 flashcodec 编解码管理。\n' +
-             '试试切换上方档位，或点「无损一致性校验」看 PNG 档与原生逐位一致。');
+  'Greedy decoding · independent prefill per turn';
+addMsg('ai', 'Hi! I am Qwen3.5-0.8B, and my KV cache is managed by flashcodec.\n' +
+             'Try switching the mode above, or click "Verify lossless match" to see the PNG mode agree with the native one bit for bit.');
 </script>
 </body>
 </html>
@@ -417,8 +419,8 @@ addMsg('ai', '你好！我是 Qwen3.5-0.8B，KV Cache 由 flashcodec 编解码�
 if __name__ == "__main__":
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
-    print(f"🌐 http://{HOST}:{PORT}  （Ctrl+C 退出）")
+    print(f"🌐 http://{HOST}:{PORT}  (Ctrl+C to quit)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n再见")
+        print("\nBye")

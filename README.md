@@ -111,7 +111,7 @@ from flashcodec import apply_flash_codec
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-0.8B",
                                              torch_dtype="bfloat16").cuda()
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
-ids = tok("杭州的西湖", return_tensors="pt").input_ids.cuda()
+ids = tok("A quiet lake at dawn", return_tensors="pt").input_ids.cuda()
 
 # One line — every generate() now runs on the codec cache
 apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2)

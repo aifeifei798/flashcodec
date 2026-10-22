@@ -1,12 +1,13 @@
-"""Qwen3.5-0.8B × flashcodec 左右对比 Gradio Chat。
+"""Qwen3.5-0.8B × flashcodec side-by-side Gradio chat.
 
-用法：python demo/qwen_gradio_chat.py   →   http://127.0.0.1:7860
-环境变量：FLASHCODEC_MODEL（默认 Qwen/Qwen3.5-0.8B）、WEBCHAT_HOST、
-WEBCHAT_PORT、WEBCHAT_NEW_TOKENS（默认 128）。
+Usage: python demo/qwen_gradio_chat.py   →   http://127.0.0.1:7860
+Environment variables: FLASHCODEC_MODEL (default Qwen/Qwen3.5-0.8B), WEBCHAT_HOST,
+WEBCHAT_PORT, WEBCHAT_NEW_TOKENS (default 128).
 
-布局：左侧原版 baseline，右侧 flashcodec（同一 prompt 顺序生成，逐 token
-流式）；底部柱状图对比「节约了什么」——KV Cache 存储与生成耗时相对原版的
-变化，外加 token 一致率与绝对数字表。
+Layout: the original baseline on the left, flashcodec on the right (same prompt,
+generated sequentially and streamed token by token); the bar chart at the bottom
+compares what was saved — KV cache storage and generation time relative to the
+original — along with the token match rate and a table of absolute numbers.
 """
 
 import os
@@ -17,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
-# 本机模型离线加载，不走代理；socks 代理 URL 会让 httpx/gradio 启动报错
+# The local model is loaded offline without a proxy; a socks proxy URL makes
+# httpx/gradio fail at startup
 for _k in ("http_proxy", "https_proxy", "all_proxy",
            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
     os.environ.pop(_k, None)
@@ -40,12 +42,13 @@ PORT = int(os.environ.get("WEBCHAT_PORT", "7860"))
 MAX_NEW = int(os.environ.get("WEBCHAT_NEW_TOKENS", "128"))
 
 MODES = {
-    "png keep=1.0（无损，逐位一致）": dict(mode="png", block_size=8, keep_ratio=1.0),
-    "jpeg k=1（8× 有损）":            dict(mode="jpeg", block_size=8, keep_freqs=1),
-    "jpeg k=2（4× 有损）":            dict(mode="jpeg", block_size=8, keep_freqs=2),
-    "jpeg k=4（2× 有损）":            dict(mode="jpeg", block_size=8, keep_freqs=4),
+    "png keep=1.0 (lossless, bitwise-identical)":
+        dict(mode="png", block_size=8, keep_ratio=1.0),
+    "jpeg k=1 (8× lossy)":            dict(mode="jpeg", block_size=8, keep_freqs=1),
+    "jpeg k=2 (4× lossy)":            dict(mode="jpeg", block_size=8, keep_freqs=2),
+    "jpeg k=4 (2× lossy)":            dict(mode="jpeg", block_size=8, keep_freqs=4),
 }
-DEFAULT_MODE = "jpeg k=2（4× 有损）"
+DEFAULT_MODE = "jpeg k=2 (4× lossy)"
 
 _CJK = ["Noto Sans SC", "Source Han Sans CN", "Noto Sans CJK SC",
         "WenQuanYi Micro Hei", "SimHei", "PingFang SC", "Microsoft YaHei"]
@@ -53,7 +56,7 @@ matplotlib.rcParams["font.sans-serif"] = _CJK + matplotlib.rcParams["font.sans-s
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"加载 {MODEL}（{device}）...")
+print(f"Loading {MODEL} ({device})...")
 tok = AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
 _dtype = torch.bfloat16 if device == "cuda" else torch.float32
 try:
@@ -64,13 +67,14 @@ except Exception:
     model = AutoModelForImageTextToText.from_pretrained(
         MODEL, local_files_only=True, dtype=_dtype)
 model = model.to(device).eval()
-print("就绪 ✅")
+print("Ready ✅")
 
 gpu_lock = threading.Lock()
 
-# baseline 的显式 DynamicCache 在混合架构（linear_attention）下不可用，
-# 改为按 config 解析 full-attention 层的 raw KV 字节——flashcodec 只压缩
-# 这些层，两侧 apples-to-apples。
+# The baseline's explicit DynamicCache is unusable on this hybrid architecture
+# (linear_attention), so we derive the raw KV bytes of the full-attention layers
+# from the config instead — flashcodec compresses only those layers, keeping the
+# two sides apples-to-apples.
 _dec = model.config.get_text_config(decoder=True)
 _layer_types, _ = get_layer_types_and_kwargs(_dec)
 N_FULL = sum(1 for t in _layer_types if t == "full_attention")
@@ -80,12 +84,12 @@ _ELEM = torch.empty((), dtype=model.dtype).element_size()
 
 
 def _baseline_attn_bytes(kv_len):
-    """原版 full-attention 层的 raw KV 总字节（K+V）。"""
+    """Total raw KV bytes (K+V) of the original full-attention layers."""
     return N_FULL * 2 * kv_len * _HKV * _HEAD_DIM * _ELEM
 
 
 class _IdStreamer(TextIteratorStreamer):
-    """记录生成的新 token id（跳过 prompt 首帧），用于一致率统计。"""
+    """Record generated token ids (skipping the prompt frame) for match stats."""
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
@@ -115,7 +119,9 @@ def _layer_kv_bytes(layer):
 
 
 def _cache_bytes(cache):
-    """cache 总占用 = codec 层归档存储 + 其余层 raw KV。返回 (total, codec 存储, codec 层 raw)。"""
+    """Total cache footprint = codec archive storage + raw KV of other layers.
+
+    Returns ``(total, codec storage, codec layer raw)``."""
     total = codec_st = codec_raw = 0
     for layer in cache.layers:
         if isinstance(layer, FlashCodecLayer):
@@ -130,7 +136,7 @@ def _cache_bytes(cache):
 
 
 def _stream_once(messages, mode_key, max_new, out):
-    """生成一条回复（流式）。结果写入 out：ids/elapsed/cache。"""
+    """Generate one reply (streaming). Results are written to out: ids/elapsed/cache."""
     prompt = tok.apply_chat_template(messages, tokenize=False,
                                      add_generation_prompt=True)
     ids = tok(prompt, return_tensors="pt").input_ids.to(device)
@@ -166,10 +172,11 @@ def _fmt_mb(b):
 
 
 def _make_plot(base, codec, mode_label):
-    """两联柱状图：绝对 KV 存储 + 相对原版变化（%）。
+    """Two-panel bar chart: absolute KV storage + change relative to the original (%).
 
-    耗时变化按**每 token 耗时**（elapsed / n_new）比较——两侧可能因 EOS
-    早停生成不同长度，直接比总耗时不公平。"""
+    Time change is compared as **time per token** (elapsed / n_new) — the two
+    sides may stop at different lengths because of EOS, so comparing total time
+    directly would not be fair."""
     b_mb = base["total"] / 1048576
     c_mb = codec["total"] / 1048576
     d_store = (c_mb / b_mb - 1) * 100 if b_mb else 0.0
@@ -180,16 +187,16 @@ def _make_plot(base, codec, mode_label):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.8))
     fig.subplots_adjust(wspace=0.35)
 
-    xs = ["原版 baseline", f"flashcodec\n{mode_label}"]
+    xs = ["Original baseline", f"flashcodec\n{mode_label}"]
     bars = ax1.bar(xs, [b_mb, c_mb], color=["#8b93a3", "#4f8cff"], width=0.55)
     for bar, val in zip(bars, [b_mb, c_mb]):
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                  f"{val:.2f} MB", ha="center", va="bottom", fontsize=10)
-    ax1.set_ylabel("full-attention 层 KV (MB)")
-    ax1.set_title("KV Cache 存储")
+    ax1.set_ylabel("full-attention KV (MB)")
+    ax1.set_title("KV cache storage")
     ax1.grid(axis="y", alpha=0.25)
 
-    names = ["KV 存储", "每 token 耗时"]
+    names = ["KV storage", "Time per token"]
     deltas = [d_store, d_time]
     colors = ["#3ecf8e" if d < 0 else "#ff6b6b" for d in deltas]
     bars2 = ax2.bar(names, deltas, color=colors, width=0.5)
@@ -199,15 +206,14 @@ def _make_plot(base, codec, mode_label):
                  f"{d:+.1f}%", ha="center",
                  va="bottom" if y >= 0 else "top", fontsize=10)
     ax2.axhline(0, color="#8b93a3", lw=0.8)
-    ax2.set_ylabel("相对原版变化 (%)")
+    ax2.set_ylabel("vs. baseline (%)")
     ax2.set_ylim(min(min(deltas) * 1.5, -10), max(max(deltas) * 1.5, 10))
-    ax2.set_title("节约幅度（负数 = 更省）")
+    ax2.set_title("Savings (negative = better)")
     ax2.grid(axis="y", alpha=0.25)
 
-    s_store = (f"存储节约 {abs(d_store):.1f}%" if d_store < 0
-               else f"存储增加 {d_store:.1f}%")
-    s_time = (f"每token耗时节省 {abs(d_time):.1f}%" if d_time < 0
-              else f"每token耗时增加 {d_time:.1f}%")
+    s_store = (f"storage saved {abs(d_store):.1f}%" if d_store < 0
+               else f"storage increased {d_store:.1f}%")
+    s_time = (f"time per token {d_time:+.1f}%")
     fig.suptitle(f"{mode_label} · {s_store} · {s_time}", fontsize=11)
     fig.subplots_adjust(top=0.82)
     fig.canvas.draw()
@@ -216,27 +222,27 @@ def _make_plot(base, codec, mode_label):
 
 def _stats_md(side, s, d_store=None, d_time=None, match=None, exact=None):
     if side == "base":
-        head = "**原版 baseline**"
-        body = (f"KV Cache `{_fmt_mb(s['total'])}`（full-attn 层 raw，"
-                f"{N_FULL} 层） · "
-                f"{s['n_new']} tok / {s['elapsed']:.2f}s · "
-                f"{s['tok_s']:.1f} tok/s · KV 长 {s['kv_len']}")
+        head = "**Original baseline**"
+        body = (f"KV cache `{_fmt_mb(s['total'])}` (full-attn raw, "
+                f"{N_FULL} layers) · "
+                f"{s['n_new']} tok / {s['elapsed']:.2f} s · "
+                f"{s['tok_s']:.1f} tok/s · KV length {s['kv_len']}")
     else:
         head = f"**flashcodec · {s['mode_label']}**"
         ratio = (s['codec_st'] / s['codec_raw'] * 100) if s['codec_raw'] else 0
-        body = (f"KV Cache `{_fmt_mb(s['total'])}`（codec 层归档 "
-                f"{_fmt_mb(s['codec_st'])} = raw 的 {ratio:.1f}%，"
-                f"{s['codec_layers']} 层） · "
-                f"{s['n_new']} tok / {s['elapsed']:.2f}s · "
-                f"{s['tok_s']:.1f} tok/s · KV 长 {s['kv_len']}")
+        body = (f"KV cache `{_fmt_mb(s['total'])}` (codec archive "
+                f"{_fmt_mb(s['codec_st'])} = {ratio:.1f}% of raw, "
+                f"{s['codec_layers']} layers) · "
+                f"{s['n_new']} tok / {s['elapsed']:.2f} s · "
+                f"{s['tok_s']:.1f} tok/s · KV length {s['kv_len']}")
         if d_store is not None:
-            s_store = (f"存储 **节约 {abs(d_store):.1f}%**" if d_store < 0
-                       else f"存储 **增加 {d_store:.1f}%**")
-            s_time = (f"每 token 耗时 **节省 {abs(d_time):.1f}%**" if d_time < 0
-                      else f"每 token 耗时 **增加 {d_time:.1f}%**")
-            body += (f"\n\n**对比原版（按每 token 归一）：** {s_store}，{s_time}，"
-                     f"token 一致率 **{match:.0%}**"
-                     + ("（逐位一致 ✅）" if exact else "（有损分叉）"))
+            s_store = (f"storage **saved {abs(d_store):.1f}%**" if d_store < 0
+                       else f"storage **increased {d_store:.1f}%**")
+            s_time = (f"time per token **saved {abs(d_time):.1f}%**" if d_time < 0
+                      else f"time per token **increased {d_time:.1f}%**")
+            body += (f"\n\n**vs. baseline (per-token normalized):** {s_store}, {s_time}, "
+                     f"token match rate **{match:.0%}**"
+                     + (" (bitwise-identical ✅)" if exact else " (lossy divergence)"))
     return f"### {head}\n{body}"
 
 
@@ -263,12 +269,12 @@ def respond(user_msg, left_hist, right_hist, mode_label, max_new):
 
     with gpu_lock:
         base_info, codec_info = {}, {}
-        # 左：原版
+        # left: original
         for piece in _stream_once(messages, None, max_new, base_info):
             left_hist[-1]["content"] += piece
             yield (gr.update(value=left_hist), gr.update(), gr.update(),
                    gr.update(), gr.update(), gr.update())
-        # 右：flashcodec
+        # right: flashcodec
         for piece in _stream_once(messages, mode_label, max_new, codec_info):
             right_hist[-1]["content"] += piece
             yield (gr.update(), gr.update(value=right_hist), gr.update(),
@@ -300,18 +306,18 @@ def respond(user_msg, left_hist, right_hist, mode_label, max_new):
         md_l = _stats_md("base", base)
         md_r = _stats_md("codec", codec, d_store, d_time, match, exact)
         table = (
-            "| 指标 | 原版 | flashcodec | 变化 |\n"
+            "| Metric | Baseline | flashcodec | Δ |\n"
             "|---|---|---|---|\n"
-            f"| KV Cache 存储 | {_fmt_mb(base['total'])} | "
+            f"| KV cache storage | {_fmt_mb(base['total'])} | "
             f"{_fmt_mb(codec['total'])} | {d_store:+.1f}% |\n"
-            f"| 每 token 耗时 | {base['elapsed'] / max(base['n_new'], 1) * 1000:.1f} ms | "
+            f"| Time per token | {base['elapsed'] / max(base['n_new'], 1) * 1000:.1f} ms | "
             f"{codec['elapsed'] / max(codec['n_new'], 1) * 1000:.1f} ms | "
             f"{d_time:+.1f}% |\n"
-            f"| 解码速度 | {base['tok_s']:.1f} tok/s | {codec['tok_s']:.1f} tok/s | "
+            f"| Decode speed | {base['tok_s']:.1f} tok/s | {codec['tok_s']:.1f} tok/s | "
             f"{(codec['tok_s'] / base['tok_s'] - 1) * 100 if base['tok_s'] else 0:+.1f}% |\n"
-            f"| 新生成 token（总耗时） | {base['n_new']}（{base['elapsed']:.2f}s） | "
-            f"{codec['n_new']}（{codec['elapsed']:.2f}s） | "
-            f"一致率 {match:.0%}{'，逐位一致' if exact else ''} |")
+            f"| New tokens (total time) | {base['n_new']} ({base['elapsed']:.2f} s) | "
+            f"{codec['n_new']} ({codec['elapsed']:.2f} s) | "
+            f"match rate {match:.0%}{', bitwise-identical' if exact else ''} |")
 
     yield (gr.update(value=left_hist), gr.update(value=right_hist),
            md_l, md_r, gr.update(value=fig), table)
@@ -321,30 +327,33 @@ def clear_all():
     return [], [], "", "", None, ""
 
 
-with gr.Blocks(title="flashcodec × Qwen3.5-0.8B") as demo:
+with gr.Blocks(title="flashcodec × Qwen3.5-0.8B · Side by side") as demo:
     gr.Markdown(
-        "# flashcodec × Qwen3.5-0.8B · 左右对比\n"
-        "同一 prompt：左侧原生 KV Cache，右侧 flashcodec 编解码 KV Cache"
-        "（JPEG 频域有损 / PNG 时域差分无损）。底部柱状图对比存储与每 token "
-        "耗时的节约（两侧可能因 EOS 早停生成不同长度，按每 token 归一才公平）。")
+        "# flashcodec × Qwen3.5-0.8B · Side by side\n"
+        "Same prompt: the left side uses the native KV cache, the right side uses "
+        "the flashcodec-compressed KV cache (JPEG frequency-domain lossy / PNG "
+        "time-domain lossless). The bar chart at the bottom compares the storage "
+        "and per-token latency savings (the two sides may stop at different lengths "
+        "because of EOS, so normalizing per token is the fair comparison).")
     with gr.Row():
-        left_bot = gr.Chatbot(label="原版 baseline（无压缩）", height=420)
-        right_bot = gr.Chatbot(label="flashcodec（压缩 KV Cache）", height=420)
+        left_bot = gr.Chatbot(label="Original baseline (no compression)", height=420)
+        right_bot = gr.Chatbot(label="flashcodec (compressed KV cache)", height=420)
     with gr.Row():
-        msg = gr.Textbox(placeholder="输入消息，Enter 发送（Shift+Enter 换行）",
-                         show_label=False, scale=7, lines=2)
-        send_btn = gr.Button("发 送", variant="primary", scale=1)
-        clear_btn = gr.Button("清空", scale=1)
+        msg = gr.Textbox(
+            placeholder="Type a message, Enter to send (Shift+Enter for a newline)",
+            show_label=False, scale=7, lines=2)
+        send_btn = gr.Button("Send", variant="primary", scale=1)
+        clear_btn = gr.Button("Clear", scale=1)
     with gr.Row():
         mode_dd = gr.Dropdown(choices=list(MODES), value=DEFAULT_MODE,
-                              label="flashcodec 档位")
+                              label="flashcodec mode")
         max_sl = gr.Slider(32, 512, value=MAX_NEW, step=16,
-                           label="最大生成 token 数")
+                           label="Max new tokens")
     with gr.Row():
         stats_l = gr.Markdown()
         stats_r = gr.Markdown()
     with gr.Row():
-        plot = gr.Plot(label="对比")
+        plot = gr.Plot(label="Comparison")
         table_md = gr.Markdown()
 
     inputs = [msg, left_bot, right_bot, mode_dd, max_sl]

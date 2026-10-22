@@ -1,16 +1,19 @@
-"""一键热补丁：让任意 HuggingFace CausalLM 默认走 FlashCodecCache。
+"""One-step hot patch: make any HuggingFace CausalLM use FlashCodecCache.
 
-机制（零侵入）：标准 HF 模型的 KV 写入/读取统一收敛在 Cache 接口——
-注意力层计算出 key/value 后调用 ``cache.update(k, v, layer_idx, ...)``
-拿回全历史 KV。因此把 Cache 对象换成 FlashCodecCache（transformers 5.x
-原生 Cache 子类），即完成"KV 写入与读取逻辑的替换"，无需针对每种注意力
-实现（GQA/MQA/RoPE 变体）做模型手术。
+Mechanism (zero intrusion): in standard HF models, KV writes/reads are all
+funnelled through the Cache interface — after the attention layer computes
+key/value it calls ``cache.update(k, v, layer_idx, ...)`` and gets the
+full-history KV back. Swapping the Cache object for FlashCodecCache (a native
+transformers 5.x Cache subclass) therefore completes the "replacement of the
+KV write and read logic" without model surgery for every attention
+implementation (GQA/MQA/RoPE variants).
 
-- `apply_flash_codec(model, ...)`：包装 `model.generate` 与 `model.forward`，
-  当请求 `use_cache` 且未显式传 `past_key_values` 时自动注入配置好的
-  FlashCodecCache；仍会遍历 model.modules() 识别标准 KV 投影注意力模块
-  （带 k_proj/v_proj）做校验与报告；
-- `remove_flash_codec(model)`：完整还原两个包装。
+- `apply_flash_codec(model, ...)`: wraps `model.generate` and `model.forward`;
+  when `use_cache` is requested and no `past_key_values` is passed explicitly,
+  it injects the configured FlashCodecCache; it still walks model.modules() to
+  find standard KV-projection attention modules (with k_proj/v_proj) for
+  validation and reporting;
+- `remove_flash_codec(model)`: fully restores both wrappers.
 """
 
 import functools
@@ -23,7 +26,8 @@ __all__ = ["apply_flash_codec", "remove_flash_codec", "undo_flash_codec",
 
 
 def find_attention_modules(model):
-    """识别标准 Self-Attention / KV 投影模块（含 k_proj 与 v_proj）。"""
+    """Find standard Self-Attention / KV projection modules (with k_proj and
+    v_proj)."""
     return [m for m in model.modules()
             if hasattr(m, "k_proj") and hasattr(m, "v_proj")]
 
@@ -34,9 +38,9 @@ def _make_factory(mode, block_size, kwargs, sink, config=None):
     if HAS_HF_CACHE:
         def factory():
             c = None
-            if config is not None:              # 混合架构（如 Qwen3.5）按
-                try:                            # layer_types 只给全注意力层挂 codec
-                    c = FlashCodecCache.from_config(
+            if config is not None:      # hybrid architecture (e.g. Qwen3.5):
+                try:                    # only full-attention layers get a codec
+                    c = FlashCodecCache.from_config(        # per layer_types
                         config, mode=mode, block_size=block_size, **codec_kw)
                 except Exception:
                     c = None
@@ -45,7 +49,7 @@ def _make_factory(mode, block_size, kwargs, sink, config=None):
                                     **codec_kw)
             sink.append(c)
             return c
-    else:                                       # 无 transformers 的保底
+    else:                                       # fallback without transformers
         def factory():
             c = CodecKVCache(mode=mode, block_size=block_size, **codec_kw)
             sink.append(c)
@@ -54,19 +58,21 @@ def _make_factory(mode, block_size, kwargs, sink, config=None):
 
 
 def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
-    """一行热补丁：为 model 注入编解码 KV Cache（transformers 5.x 原生）。
+    """One-line hot patch: inject a codec KV cache into model (native
+    transformers 5.x).
 
-    支持 mode="jpeg"（kwargs: keep_freqs，默认 2）与
-    mode="png"（kwargs: keep_ratio，默认 1.0）。
-    之后每次 `model.generate(..., use_cache=True)`（未显式传
-    past_key_values）都会自动使用 FlashCodecCache。返回 model，
-    `remove_flash_codec(model)` 可随时还原。"""
+    Supports mode="jpeg" (kwargs: keep_freqs, default 2) and
+    mode="png" (kwargs: keep_ratio, default 1.0).
+    Afterwards every `model.generate(..., use_cache=True)` call that does not
+    pass past_key_values explicitly uses FlashCodecCache. Returns model;
+    `remove_flash_codec(model)` restores it at any time."""
     if getattr(model, "_flashcodec", None) is not None:
-        warnings.warn("model 已打过 flashcodec 补丁，先 remove_flash_codec")
+        warnings.warn("model is already patched with flashcodec, "
+                      "call remove_flash_codec first")
         return model
 
     attns = find_attention_modules(model)
-    caches = []                                 # 供测试/诊断检查实际注入的缓存
+    caches = []                    # lets tests/diagnostics inspect injected caches
     factory = _make_factory(mode, block_size, kwargs, caches,
                             config=getattr(model, "config", None))
 
@@ -92,8 +98,9 @@ def apply_flash_codec(model, mode="jpeg", block_size=8, **kwargs):
         "mode": mode, "caches": caches, "attention_modules": attns,
         "undo": lambda: _restore(model, base_generate, base_forward)}
     if not attns:
-        warnings.warn("未找到带 k_proj/v_proj 的注意力模块——若模型使用非标准 "
-                      "KV 接口，补丁可能不生效")
+        warnings.warn("no attention module with k_proj/v_proj found — if the "
+                      "model uses a non-standard KV interface, the patch may "
+                      "have no effect")
     return model
 
 
@@ -104,10 +111,11 @@ def _restore(model, base_generate, base_forward):
 
 
 def remove_flash_codec(model):
-    """撤销 apply_flash_codec 打的补丁（generate 与 forward 均还原）。"""
+    """Undo the patch applied by apply_flash_codec (restores both generate and
+    forward)."""
     info = getattr(model, "_flashcodec", None)
     if info is not None:
         info["undo"]()
 
 
-undo_flash_codec = remove_flash_codec          # 旧名兼容
+undo_flash_codec = remove_flash_codec          # legacy alias

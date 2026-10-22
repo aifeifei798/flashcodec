@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flashcodec"
 version = "0.1.0"
-description = "把 Transformer 的时序 KV Cache 张量当作高维多媒体图像信号来压缩：JPEG 式频域（DCT）有损 + PNG 式时域差分无损"
+description = "Compress Transformer time-series KV cache tensors as high-dimensional multimedia image signals: JPEG-style lossy frequency domain (DCT) plus PNG-style lossless time-domain deltas"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

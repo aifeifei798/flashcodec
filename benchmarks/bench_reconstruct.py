@@ -1,7 +1,8 @@
-"""重构质量压测：不同模式/档位下的 PSNR 与余弦相似度。
+"""Reconstruction-quality benchmark: PSNR and cosine similarity per mode.
 
-信号：合成自相关隐向量（随机游走，模拟真实 KV 的强时序相关）。
-用法：.venv/bin/python benchmarks/bench_reconstruct.py
+Signal: synthetic autocorrelated latents (random walk, mimicking the strong
+temporal correlation of real KV caches).
+Usage: .venv/bin/python benchmarks/bench_reconstruct.py
 """
 
 import math
@@ -16,7 +17,7 @@ from flashcodec import CodecKVCache
 
 torch.manual_seed(0)
 B, H, S, D = 2, 8, 2048, 64
-x = torch.cumsum(torch.randn(B, H, S, D) * 0.1, dim=-2)   # 自相关隐向量
+x = torch.cumsum(torch.randn(B, H, S, D) * 0.1, dim=-2)   # autocorrelated latents
 
 
 def psnr(ref, hat):
@@ -39,7 +40,7 @@ CONFIGS = [
     ("png", dict(mode="png", keep_ratio=1.0)),
 ]
 
-print(f"signal: random-walk B={B} H={H} S={S} D={D}（自相关隐向量模拟）\n")
+print(f"signal: random-walk B={B} H={H} S={S} D={D} (autocorrelated latent simulation)\n")
 header = f"{'config':<16} | {'PSNR(dB)':>9} | {'cosine':>8} | {'storage':>8}"
 print(header)
 print("-" * len(header))
