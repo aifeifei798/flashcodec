@@ -191,8 +191,8 @@ H_kv=8, H_q=16, D=128, `jpeg k=2 int8` (`benchmarks/bench_attention.py --cuda`):
 
 | seq | materialized | coefficient (torch) | coefficient (Triton) |
 |---|---|---|---|
-| 16384 | 0.20ms / 130MB | 0.34ms / 24MB | **0.10ms / 0MB** |
-| 65536 | 0.89ms / 520MB | 0.43ms / 96MB | **0.17ms / 0MB** |
+| 16384 | 0.20ms / 130MB | 0.29ms / 24MB | **0.09ms / 0MB** |
+| 65536 | 0.86ms / 520MB | 0.41ms / 96MB | **0.16ms / 0MB** |
 
 `apply_flash_codec(model, ..., materialization_free=True)` wires it into
 transformers: the forward of standard Llama/Qwen-style attention modules is
@@ -309,13 +309,13 @@ truncation; otherwise prefer `quant_bits=8`.
 
 | seq | Mode | storage | ratio | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 7.4ms | 0.1ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 31.6ms | 0.3ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 125.0ms | 3.2ms |
-| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 11.2ms | 0.1ms |
-| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 44.0ms | 0.4ms |
-| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 180.5ms | 3.2ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 224.1ms | 3.2ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 6.7ms | 0.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 34.3ms | 0.5ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 141.9ms | 3.1ms |
+| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 9.2ms | 0.0ms |
+| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 46.0ms | 0.3ms |
+| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 197.9ms | 3.1ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 243.3ms | 3.3ms |
 
 CPU timings vary ~±20% between runs (min of 3); the storage/ratio columns are
 exact. `read` = materialize the view and touch it (`.sum()`, so the number is the
@@ -363,6 +363,16 @@ python tests/test_hf_integration.py # native transformers 5.x generate: explicit
 python tests/test_attention.py      # coefficient-domain decode attention matches the materialized
                                     # path (jpeg / int8 / png, GQA); never builds the KV view
 ```
+
+## Stability (1.x)
+
+The public API is frozen for 1.x: `apply_flash_codec` / `remove_flash_codec`,
+`apply_codec_attention` / `remove_codec_attention`, `FlashCodecCache`,
+`FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+`codec_decode_attention`, `make_codec`, plus the `quant_bits` / `per_layer`
+options. New features ship as additive arguments; existing signatures keep
+their defaults. The caveats below still apply — this is a research library with
+a stable interface, not a claim of production readiness.
 
 ## Boundaries (honest list)
 

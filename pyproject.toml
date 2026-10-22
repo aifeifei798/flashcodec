@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashcodec-kv"
-version = "0.6.1"
+version = "1.0.0"
 description = "Compress Transformer time-series KV cache tensors as high-dimensional multimedia image signals: JPEG-style lossy frequency domain (DCT) plus PNG-style lossless time-domain deltas"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "feifei", email = "aifeifei798@gmail.com" }]
 keywords = ["kv-cache", "transformer", "dct", "compression", "llm", "inference"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

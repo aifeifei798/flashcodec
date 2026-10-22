@@ -21,7 +21,7 @@ from .patch import apply_flash_codec, find_attention_modules, \
 from .patch_attention import apply_codec_attention, codec_attention_stats, \
     remove_codec_attention
 
-__version__ = "0.6.1"
+__version__ = "1.0.0"
 
 __all__ = [
     "apply_flash_codec", "remove_flash_codec", "undo_flash_codec",

@@ -173,8 +173,8 @@ launch 开销。单层、B=1、H_kv=8、H_q=16、D=128、`jpeg k=2 int8`
 
 | seq | 物化 | 系数域（torch） | 系数域（Triton） |
 |---|---|---|---|
-| 16384 | 0.20ms / 130MB | 0.34ms / 24MB | **0.10ms / 0MB** |
-| 65536 | 0.89ms / 520MB | 0.43ms / 96MB | **0.17ms / 0MB** |
+| 16384 | 0.20ms / 130MB | 0.29ms / 24MB | **0.09ms / 0MB** |
+| 65536 | 0.86ms / 520MB | 0.41ms / 96MB | **0.16ms / 0MB** |
 
 `apply_flash_codec(model, ..., materialization_free=True)` 已把它接进
 transformers：包装标准 Llama/Qwen 风格 attention 模块的 forward（投影 + RoPE
@@ -280,13 +280,13 @@ k=4、其余保持 k=r（75% 存储）：
 
 | seq | 模式 | storage | 原始比 | fill | read |
 |---|---|---|---|---|---|
-| 4096 | jpeg k=2 | 4.0MB | 0.25 | 7.4ms | 0.1ms |
-| 16384 | jpeg k=2 | 16.0MB | 0.25 | 31.6ms | 0.3ms |
-| 65536 | jpeg k=2 | 64.0MB | 0.25 | 125.0ms | 3.2ms |
-| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 11.2ms | 0.1ms |
-| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 44.0ms | 0.4ms |
-| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 180.5ms | 3.2ms |
-| 65536 | png keep=1.0 | 256.0MB | 1.00 | 224.1ms | 3.2ms |
+| 4096 | jpeg k=2 | 4.0MB | 0.25 | 6.7ms | 0.0ms |
+| 16384 | jpeg k=2 | 16.0MB | 0.25 | 34.3ms | 0.5ms |
+| 65536 | jpeg k=2 | 64.0MB | 0.25 | 141.9ms | 3.1ms |
+| 4096 | jpeg k=2 int8 | 1.1MB | 0.07 | 9.2ms | 0.0ms |
+| 16384 | jpeg k=2 int8 | 4.3MB | 0.07 | 46.0ms | 0.3ms |
+| 65536 | jpeg k=2 int8 | 17.0MB | 0.07 | 197.9ms | 3.1ms |
+| 65536 | png keep=1.0 | 256.0MB | 1.00 | 243.3ms | 3.3ms |
 
 CPU 计时逐次波动约 ±20%（取 3 次最小）；storage/ratio 两列是精确值。
 `read` 为「物化视图并真实读取（`.sum()`）」的耗时，即消费端成本而非仅 kernel
@@ -332,6 +332,15 @@ python tests/test_hf_integration.py # transformers 5.x 原生 generate 集成：
 python tests/test_attention.py      # 系数域解码 attention 与物化路径一致
                                     # （jpeg / int8 / png、GQA），且从不构建 KV 视图
 ```
+
+## 稳定性（1.x）
+
+1.x 期间公开 API 冻结：`apply_flash_codec` / `remove_flash_codec`、
+`apply_codec_attention` / `remove_codec_attention`、`FlashCodecCache`、
+`FlashCodecLayer`、`CodecKVCache`、`JPEGCodec`、`PNGCodec`、
+`codec_decode_attention`、`make_codec`，以及 `quant_bits` / `per_layer` 选项。
+新功能只做增量参数；既有签名默认值不变。下面的边界清单依然成立——这是一个
+接口稳定的研究库，不等于生产就绪承诺。
 
 ## 边界与说明（诚实清单）
 

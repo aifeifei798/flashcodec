@@ -8,6 +8,39 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [1.0.0] — 2026-10-23
+
+First stable release. The public surface is frozen for the 1.x line (breaking
+changes need a 2.0); the research caveats in the README's *Boundaries* still
+apply, and every number in the README is measured.
+
+### What 1.0 covers
+
+- **Codecs**: `jpeg` (blockwise DCT-II, keep k of r, optional int8 coefficients
+  with per-(block, frequency) scales) and `png` (anchor + first-order deltas,
+  bitwise lossless at `keep_ratio=1.0`).
+- **Caches**: `CodecKVCache` (standalone, no transformers) and
+  `FlashCodecCache` / `FlashCodecLayer` (native `transformers` 5.x Cache
+  backend, hybrid architectures via `from_config`, per-layer budgets).
+- **Integration**: `apply_flash_codec` / `remove_flash_codec` hot patch; beam
+  search (`reorder_cache`), exact `crop`, memoized `read()`.
+- **Decode attention**: coefficient-domain `codec_decode_attention` (no KV view)
+  plus the Triton split-K kernel, wired into `generate` with
+  `materialization_free=True` for standard Llama/Qwen/Qwen3.5 attention.
+- **Benchmarks**: `bench_reconstruct`, `bench_vram` (CUDA-event timed),
+  `bench_attention`, `bench_e2e`, `bench_ppl`, `bench_adaptive`,
+  `run_qwen_demo`.
+- **Demo**: five tiers, materialization-free toggle, and a full per-tier
+  comparison (storage / speed / memory / continuation NLL / token match).
+
+### Stability
+
+The 1.x public API: `apply_flash_codec`, `remove_flash_codec`,
+`apply_codec_attention`, `remove_codec_attention`, `FlashCodecCache`,
+`FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+`codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`. New options
+are additive; existing signatures keep their defaults.
+
 ## [0.6.1] — 2026-10-23
 
 ### Fixed

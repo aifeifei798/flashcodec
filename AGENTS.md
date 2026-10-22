@@ -212,3 +212,8 @@ Read this whole file before making changes.
   `benchmarks/run_qwen_demo.py` (the measured tables in the README must be updated
   accordingly — every number in the README was actually measured; no placeholders
   or stale data), then `uv build`.
+- **1.x API is frozen**: `apply_flash_codec` / `remove_flash_codec`,
+  `apply_codec_attention` / `remove_codec_attention`, `FlashCodecCache`,
+  `FlashCodecLayer`, `CodecKVCache`, `JPEGCodec`, `PNGCodec`,
+  `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`. Add options
+  with defaults; breaking changes need a 2.0.
