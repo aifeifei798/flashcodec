@@ -135,6 +135,20 @@ differences lose the bitwise-exactness the lossless tier promises); JPEG
 coefficients and `read()` views stay in the stream's input dtype (SDPA
 requires q/k/v dtype parity).
 
+## Demo (side-by-side chat on Qwen3.5-0.8B)
+
+![flashcodec side-by-side Gradio demo](images/demo.png)
+
+Same prompt, two panels: native KV cache on the left, flashcodec on the
+right (mode switchable: png lossless / jpeg k=1,2,4), with a bar chart of
+storage & latency savings and a token-match table underneath.
+
+```bash
+pip install gradio matplotlib
+python demo/qwen_gradio_chat.py    # Gradio side-by-side + savings chart
+python demo/qwen_webchat.py        # zero-dependency stdlib SSE webchat
+```
+
 ## Benchmarks (measured; B=2 H=8 S=2048 D=64, random-walk autocorrelated signal, fp32)
 
 ### Reconstruction quality (`benchmarks/bench_reconstruct.py`)
@@ -168,10 +182,12 @@ flashcodec/
 │   ├── __init__.py        # apply_flash_codec / CodecKVCache / JPEGCodec / PNGCodec
 │   ├── codecs/jpeg.py     # DCT-II basis, project/reconstruct (pure GEMM, no loops)
 │   ├── codecs/png.py      # anchor + first-order delta, cumsum, Top-M filter
-│   ├── cache.py           # CodecKVCache: raw tail + block archives, full/incr interfaces
+│   ├── cache.py           # CodecKVCache: raw tail + capacity-doubled archives
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
 ├── tests/                 # jpeg / png / causal suites (standalone scripts or pytest)
 ├── benchmarks/            # storage benchmark + PSNR/cosine quality benchmark
+├── demo/                  # Gradio side-by-side chat + zero-dependency webchat
+├── images/                # README screenshots
 ├── pyproject.toml
 └── README.md
 ```

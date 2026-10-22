@@ -123,6 +123,20 @@ dtype 契约（详见 `AGENTS.md`）：PNG 差分恒为 fp32（bf16 差分会破
 档承诺的逐位精确性）；JPEG 系数与 `read()` 视图保持流输入 dtype
 （SDPA 要求 q/k/v 同 dtype）。
 
+## Demo（Qwen3.5-0.8B 左右对比 Chat）
+
+![flashcodec Gradio 左右对比 demo](images/demo.png)
+
+同一 prompt 两栏并排：左侧原生 KV Cache，右侧 flashcodec（档位可切：
+png 无损 / jpeg k=1,2,4），底部柱状图对比存储与耗时的节约，并附 token
+一致率表。
+
+```bash
+pip install gradio matplotlib
+python demo/qwen_gradio_chat.py    # Gradio 左右对比 + 节约柱状图
+python demo/qwen_webchat.py        # 零依赖 stdlib SSE webchat
+```
+
 ## 基准（实测，B=2 H=8 S=2048 D=64，随机游走自相关信号，fp32）
 
 ### 重构质量（`benchmarks/bench_reconstruct.py`）
@@ -155,10 +169,12 @@ flashcodec/
 │   ├── __init__.py        # apply_flash_codec / CodecKVCache / JPEGCodec / PNGCodec
 │   ├── codecs/jpeg.py     # DCT-II 基底、投影/重构（纯 GEMM，无循环）
 │   ├── codecs/png.py      # Anchor + 一阶差分、cumsum 还原、Top-M 阈值滤波
-│   ├── cache.py           # CodecKVCache：raw 尾 + 分块归档，全量/增量双接口
+│   ├── cache.py           # CodecKVCache：raw 尾 + 倍增预分配归档，全量/增量双接口
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
 ├── tests/                 # jpeg / png / causal 三组测试（直接运行或 pytest）
 ├── benchmarks/            # 显存压测 + PSNR/余弦质量压测
+├── demo/                  # Gradio 左右对比 chat + 零依赖 stdlib webchat
+├── images/                # README 截图
 ├── pyproject.toml
 └── README.md
 ```

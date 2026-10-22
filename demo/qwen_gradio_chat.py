@@ -166,11 +166,16 @@ def _fmt_mb(b):
 
 
 def _make_plot(base, codec, mode_label):
-    """两联柱状图：绝对 KV 存储 + 相对原版变化（%）。"""
+    """两联柱状图：绝对 KV 存储 + 相对原版变化（%）。
+
+    耗时变化按**每 token 耗时**（elapsed / n_new）比较——两侧可能因 EOS
+    早停生成不同长度，直接比总耗时不公平。"""
     b_mb = base["total"] / 1048576
     c_mb = codec["total"] / 1048576
     d_store = (c_mb / b_mb - 1) * 100 if b_mb else 0.0
-    d_time = (codec["elapsed"] / base["elapsed"] - 1) * 100 if base["elapsed"] else 0.0
+    b_t = base["elapsed"] / max(base["n_new"], 1)
+    c_t = codec["elapsed"] / max(codec["n_new"], 1)
+    d_time = (c_t / b_t - 1) * 100 if b_t > 0 else 0.0
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3.8))
     fig.subplots_adjust(wspace=0.35)
@@ -184,7 +189,7 @@ def _make_plot(base, codec, mode_label):
     ax1.set_title("KV Cache 存储")
     ax1.grid(axis="y", alpha=0.25)
 
-    names = ["KV 存储", "生成耗时"]
+    names = ["KV 存储", "每 token 耗时"]
     deltas = [d_store, d_time]
     colors = ["#3ecf8e" if d < 0 else "#ff6b6b" for d in deltas]
     bars2 = ax2.bar(names, deltas, color=colors, width=0.5)
@@ -201,8 +206,8 @@ def _make_plot(base, codec, mode_label):
 
     s_store = (f"存储节约 {abs(d_store):.1f}%" if d_store < 0
                else f"存储增加 {d_store:.1f}%")
-    s_time = (f"耗时节省 {abs(d_time):.1f}%" if d_time < 0
-              else f"耗时增加 {d_time:.1f}%")
+    s_time = (f"每token耗时节省 {abs(d_time):.1f}%" if d_time < 0
+              else f"每token耗时增加 {d_time:.1f}%")
     fig.suptitle(f"{mode_label} · {s_store} · {s_time}", fontsize=11)
     fig.subplots_adjust(top=0.82)
     fig.canvas.draw()
@@ -227,9 +232,9 @@ def _stats_md(side, s, d_store=None, d_time=None, match=None, exact=None):
         if d_store is not None:
             s_store = (f"存储 **节约 {abs(d_store):.1f}%**" if d_store < 0
                        else f"存储 **增加 {d_store:.1f}%**")
-            s_time = (f"耗时 **节省 {abs(d_time):.1f}%**" if d_time < 0
-                      else f"耗时 **增加 {d_time:.1f}%**")
-            body += (f"\n\n**对比原版：** {s_store}，{s_time}，"
+            s_time = (f"每 token 耗时 **节省 {abs(d_time):.1f}%**" if d_time < 0
+                      else f"每 token 耗时 **增加 {d_time:.1f}%**")
+            body += (f"\n\n**对比原版（按每 token 归一）：** {s_store}，{s_time}，"
                      f"token 一致率 **{match:.0%}**"
                      + ("（逐位一致 ✅）" if exact else "（有损分叉）"))
     return f"### {head}\n{body}"
@@ -299,11 +304,13 @@ def respond(user_msg, left_hist, right_hist, mode_label, max_new):
             "|---|---|---|---|\n"
             f"| KV Cache 存储 | {_fmt_mb(base['total'])} | "
             f"{_fmt_mb(codec['total'])} | {d_store:+.1f}% |\n"
-            f"| 生成耗时 | {base['elapsed']:.2f}s | {codec['elapsed']:.2f}s | "
+            f"| 每 token 耗时 | {base['elapsed'] / max(base['n_new'], 1) * 1000:.1f} ms | "
+            f"{codec['elapsed'] / max(codec['n_new'], 1) * 1000:.1f} ms | "
             f"{d_time:+.1f}% |\n"
             f"| 解码速度 | {base['tok_s']:.1f} tok/s | {codec['tok_s']:.1f} tok/s | "
             f"{(codec['tok_s'] / base['tok_s'] - 1) * 100 if base['tok_s'] else 0:+.1f}% |\n"
-            f"| 新生成 token | {base['n_new']} | {codec['n_new']} | "
+            f"| 新生成 token（总耗时） | {base['n_new']}（{base['elapsed']:.2f}s） | "
+            f"{codec['n_new']}（{codec['elapsed']:.2f}s） | "
             f"一致率 {match:.0%}{'，逐位一致' if exact else ''} |")
 
     yield (gr.update(value=left_hist), gr.update(value=right_hist),
@@ -318,7 +325,8 @@ with gr.Blocks(title="flashcodec × Qwen3.5-0.8B") as demo:
     gr.Markdown(
         "# flashcodec × Qwen3.5-0.8B · 左右对比\n"
         "同一 prompt：左侧原生 KV Cache，右侧 flashcodec 编解码 KV Cache"
-        "（JPEG 频域有损 / PNG 时域差分无损）。底部柱状图对比存储与耗时的节约。")
+        "（JPEG 频域有损 / PNG 时域差分无损）。底部柱状图对比存储与每 token "
+        "耗时的节约（两侧可能因 EOS 早停生成不同长度，按每 token 归一才公平）。")
     with gr.Row():
         left_bot = gr.Chatbot(label="原版 baseline（无压缩）", height=420)
         right_bot = gr.Chatbot(label="flashcodec（压缩 KV Cache）", height=420)
