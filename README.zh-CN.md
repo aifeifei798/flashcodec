@@ -431,8 +431,11 @@ Gemma4-12B（48 层，40 SWA + 8 全局 MQA）用 `--kl-divergence` 测得：8-b
 
 **随后的 HF 侧 KL 预判把这最后一个方向也关掉了**：同字节下，变换只在行量化
 已经造成破坏时有效（Qwen3-0.6B：8-bit KL 低 3×，4-bit 低 2.3× 但仍然崩），
-在 Hy-MT2-1.8B 和 Gemma4-E2B 上则是 8-bit 持平、**4-bit 更差**。
-不存在值得落地的工况，因此**不跟进 llama.cpp 实现**。完整表格、机理与复现：
+在 Hy-MT2-1.8B 和 Gemma4-E2B 上则是 8-bit 持平、4-bit 略差；而在**普通稠密
+Qwen3-8B**（对 codec 最有利的架构）上，真正重要的工况完全没变化
+（`q8_0` K + `q4_0` V、40.6% 字节：KL 0.0047 vs 加 DCT 的 0.0045，
+top-1 97.3% vs 97.2%），双侧 4-bit 反而差 6%。不存在值得落地的工况，
+因此**不跟进 llama.cpp 实现**。完整表格、机理与复现：
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 
 ## 目录结构

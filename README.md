@@ -479,10 +479,14 @@ ppl cannot be used there.
 
 **The HF-side KL pre-judgment then closes the follow-up**: at equal bytes the
 transform helps only where row quantization is already destructive (Qwen3-0.6B:
-3× lower KL at 8 bits, 2.3× at 4 bits but still broken), and is neutral at
-8 bits / **worse at 4 bits** on Hy-MT2-1.8B and Gemma4-E2B. There is no
-operating point where it is worth shipping — so **no llama.cpp integration
-follows from this**. Full tables, mechanism and reproduction:
+3× lower KL at 8 bits, 2.3× at 4 bits but still broken), is neutral at 8 bits /
+slightly worse at 4 bits on Hy-MT2-1.8B and Gemma4-E2B, and on a **plain dense
+Qwen3-8B** — the most favourable case — it changes nothing at the operating
+point that matters (`q8_0` K + `q4_0` V at 40.6% bytes: KL 0.0047 raw vs 0.0045
+with DCT on K, top-1 97.3% vs 97.2%) while being 6% worse at 4 bits on both
+sides. There is no operating point where it is worth shipping — so **no
+llama.cpp integration follows from this**. Full tables, mechanism and
+reproduction:
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 
 ## Repository layout

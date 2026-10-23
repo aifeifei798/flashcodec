@@ -41,9 +41,12 @@ sometimes *improves* under quantization, so KL is the only usable metric there.
 
 **But the HF-side KL pre-judgment kills the follow-up** (§8): at equal bytes the
 transform helps only where row quantization is already destructive
-(Qwen3-0.6B: 3× lower KL at 8 bits), and is neutral at 8 bits / **worse at
-4 bits** on Hy-MT2-1.8B and Gemma4-E2B. There is no operating point where it is
-worth implementing, so **no llama.cpp integration follows from this**.
+(Qwen3-0.6B: 3× lower KL at 8 bits), is neutral at 8 bits / slightly worse at
+4 bits on Hy-MT2-1.8B and Gemma4-E2B, and on a **plain dense Qwen3-8B** — the
+most favourable case — it changes nothing at the operating point that matters
+(`q8_0` K + `q4_0` V, 40.6% bytes: KL 0.0047 raw vs 0.0045 with DCT on K) while
+being 6% worse at 4 bits on both sides. There is no operating point where it is
+worth shipping, so **no llama.cpp integration follows from this**.
 
 Finally, K and V are not equally sensitive, which changes how a KV budget should
 be spent.
@@ -322,6 +325,13 @@ are adjacent rows.
 
 | model | tier | KL | top-1 | of fp16 |
 |---|---|---|---|---|
+| Qwen3-8B (36 layers, 8 KV heads, plain dense GQA) | `q8_0` K+V | 0.0009 | 99.2% | 53.1% |
+| | dct b32 + q8 K+V | **0.0005** | 99.1% | 53.1% |
+| | `q4_0` K+V | 0.0802 | 89.0% | 28.1% |
+| | dct b32 + q4 K+V | 0.0852 | 88.4% | 28.1% |
+| | `q8_0` K + `q4_0` V | 0.0047 | 97.3% | 40.6% |
+| | dct b32 + q8 K, q4 V | 0.0045 | 97.2% | 40.6% |
+| | dct b32 + q4 K, q8 V | 0.0541 | 90.5% | 40.6% |
 | Qwen3-0.6B (28 layers, 8 KV heads) | `q8_0` K+V | 0.0168 | 93.8% | 53.1% |
 | | dct b32 + q8 K+V | **0.0056** | **95.8%** | 53.1% |
 | | `q4_0` K+V | 2.3752 | 33.2% | 28.1% |
@@ -335,25 +345,31 @@ are adjacent rows.
 | | `q4_0` K+V | 0.2788 | 79.7% | 12.1% |
 | | dct b32 + q4 K+V | 0.3301 | 78.8% | 12.1% |
 
-Reading:
+Qwen3-8B is the decisive row because it is the architecture the codec was
+designed against — plain dense GQA, no SWA, no hybrid, no MQA:
 
-- The transform wins **only where raw row quantization is already destructive**
-  (0.6B): 3x lower KL at 8 bits, 2.3x at 4 bits — and even there 4-bit stays
-  broken (KL 1.03, top-1 53%).
-- On the two larger models it is **neutral at 8 bits and worse at 4 bits**
-  (2.7x KL on Hy-MT2, +18% on Gemma4-E2B), because there is nothing to fix:
-  `q8_0` is already ~0 and `q4_0` is tolerable.
-- The mechanism of §5 is real, but it only acts on a distortion that exists at
-  small scale. In the regimes where the transform would be worth implementing,
-  it has no room; where it has room, the model is already unusable.
+- At the operating point that actually matters — `q8_0` K + `q4_0` V, 40.6% of
+  fp16 bytes — the transform changes **nothing**: KL 0.0047 raw vs 0.0045 with
+  DCT on K, top-1 97.3% vs 97.2%. Spending the 4 bits on V instead of K is worth
+  10× more than transforming K.
+- At 8 bits both are effectively free (0.0009 vs 0.0005).
+- At 4 bits on both sides the transform is **6% worse** (0.0802 -> 0.0852).
+- K is again ~18× more sensitive than V (0.0748 vs 0.0042 at `q4_0`), i.e. the
+  K/V asymmetry of Qwen3-0.6B is an architecture property, not a size effect.
+
+Across all four models the transform wins only where raw row quantization is
+already destructive (0.6B: 3× lower KL at 8 bits, 2.3× at 4 bits — and there
+4-bit stays broken), is neutral or slightly better at 8 bits elsewhere, and is
+worse at 4 bits except on the model that is already broken.
 
 **Verdict: do not implement this in llama.cpp** (no S2, no kernel). The cheap
-pre-judgment answers the question in an afternoon instead of a week.
+pre-judgment answers the question in an afternoon instead of a week, and a plain
+dense 8B — the most favourable case for the codec — closes it.
 
-Caveats: 8k scored tokens per model; the harness keeps the full 1024-token
+Caveats: 8k–16k scored tokens per model; the harness keeps the full 1024-token
 history for SWA layers (no window cropping), so the byte ratios are relative to
-an uncropped fp16 cache; the checkpoints are finetunes and the DCT is applied to
-every layer.
+an uncropped fp16 cache; the 0.6B/1.8B/Gemma4 checkpoints are finetunes (the
+Qwen3-8B one is the base model); the DCT is applied to every layer.
 
 ## 9. What this means for flashcodec
 

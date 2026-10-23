@@ -57,6 +57,14 @@ placeholder package).
   (0.0025 -> 0.0028) with worse 4-bit (0.279 -> 0.330) on Gemma4-E2B. Verdict:
   no operating point where the codec is worth shipping, so no llama.cpp
   implementation follows.
+- Same doc, §8: adds a **plain dense Qwen3-8B** (36 layers, 8 KV heads, no SWA /
+  hybrid / MQA) as the decisive row — the architecture the codec was designed
+  against. `q8_0` KL 0.0009 / top-1 99.2% -> dct+q8 0.0005 / 99.1% (both
+  negligible); `q4_0` 0.0802 -> dct+q4 0.0852 (6% worse); at the operating point
+  that matters, `q8_0` K + `q4_0` V (40.6% bytes), KL is 0.0047 raw vs 0.0045
+  with DCT on K (top-1 97.3% vs 97.2%), i.e. the transform is a no-op while
+  spending the 4 bits on V instead of K is worth 10x. K is again ~18x more
+  sensitive than V, so the K/V asymmetry is architectural, not a size effect.
 
 ## [1.0.0] — 2026-10-23
 
