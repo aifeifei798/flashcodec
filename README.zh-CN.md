@@ -2,6 +2,9 @@
 
 > 把 Transformer 的时序 KV Cache 张量当作**高维多媒体图像信号**来压缩。
 
+[![PyPI](https://img.shields.io/pypi/v/flashcodec-kv.svg)](https://pypi.org/project/flashcodec-kv/)
+[![CI](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 传统 LLM 研究把隐空间张量视为孤立标量因子；flashcodec 认为 `(B, H, S, D)`
@@ -59,7 +62,10 @@ keep_ratio=1.0` 的无损档位下，逐步解码注意力与全量前向注意�
 ## 安装
 
 ```bash
-pip install -e ".[hf]"  # 源码安装：torch>=2.0（HF 后端另需 transformers>=5.20）
+pip install flashcodec-kv            # 核心：torch>=2.0
+pip install "flashcodec-kv[hf]"      # + transformers 5.x 后端
+pip install "flashcodec-kv[demo]"    # + gradio/matplotlib（demo 用）
+pip install -e ".[hf]"               # 或从源码安装
 ```
 
 PyPI 分发包名：`flashcodec-kv`，导入名仍是 `flashcodec`（PyPI 上的

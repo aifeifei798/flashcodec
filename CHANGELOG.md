@@ -41,6 +41,9 @@ The 1.x public API: `apply_flash_codec`, `remove_flash_codec`,
 `codec_decode_attention`, `make_codec`, `quant_bits`, `per_layer`. New options
 are additive; existing signatures keep their defaults.
 
+Published to PyPI as [`flashcodec-kv` 1.0.0](https://pypi.org/project/flashcodec-kv/)
+(import name stays `flashcodec`).
+
 ## [0.6.1] — 2026-10-23
 
 ### Fixed

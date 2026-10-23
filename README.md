@@ -2,6 +2,9 @@
 
 > Compressing Transformer KV Cache tensors as **high-dimensional multimedia image signals**.
 
+[![PyPI](https://img.shields.io/pypi/v/flashcodec-kv.svg)](https://pypi.org/project/flashcodec-kv/)
+[![CI](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/aifeifei798/flashcodec-kv/actions/workflows/ci.yml)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 Conventional LLM research treats hidden-space tensors as isolated scalar
@@ -69,12 +72,15 @@ decoded attention matches full-sequence attention within ≤1e-4.
 ## Installation
 
 ```bash
-pip install -e ".[hf]"  # from source: torch>=2.0 (+ transformers>=5.20 for the HF backend)
+pip install flashcodec-kv            # core: torch>=2.0
+pip install "flashcodec-kv[hf]"      # + transformers 5.x backend
+pip install "flashcodec-kv[demo]"    # + gradio/matplotlib for the demo
+pip install -e ".[hf]"               # or from source
 ```
 
-Distribution name on PyPI: `flashcodec-kv` — the import name stays
-`flashcodec`. (The bare `flashcodec` name there belongs to an unrelated
-placeholder package, so don't `pip install flashcodec`.)
+Distribution name is `flashcodec-kv`; the import name stays `flashcodec`. (The
+bare `flashcodec` name on PyPI belongs to an unrelated placeholder package, so
+don't `pip install flashcodec`.)
 
 ## Quick start
 
