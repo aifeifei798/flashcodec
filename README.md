@@ -441,7 +441,8 @@ llama.cpp `184f65360`, CUDA + FA):
 | `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
 | `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
 
-Against that bar, flashcodec does **not** win at equal bytes:
+Against that bar, flashcodec's **current archive format** does not win at equal
+bytes:
 
 - **truncation (`k < r`)**: `jpeg k=4` on K (75% of fp16 K bytes) damages as
   much as `q4_0` on everything (28% of fp16 KV bytes) — 2.7× more bytes for the
@@ -453,11 +454,19 @@ Against that bar, flashcodec does **not** win at equal bytes:
   per 32) for 63% more damage, and on `q4_0` an int8 coefficient archive is
   *larger* than the 4-bit payload it replaces (39.8% vs 28.1%).
 
+**The coefficient quantizer is what loses, not the transform.** Give the
+coefficients the same per-32 absmax that ggml uses (lossless basis, identical
+byte count) and the ordering reverses: **5× less perplexity damage at 8 bits and
+7× less at 4 bits**, with the reconstruction error unchanged — the transform
+shifts the quantization error into the slowly-varying subspace, which softmax
+barely sees (error shaping, not a better K). Measured in HF; still to be
+confirmed inside llama.cpp, and it does not make 4-bit K usable on this model
+(ppl 41.6 vs 18.6).
+
 The measurements also show K and V are asymmetric: 4-bit **K** is the only
 cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
-the cheap production setting is `-ctk q8_0 -ctv q4_0`, and any future codec work
-has to target **K at 25% bytes** with a rotation/per-channel quantizer, not
-coefficient truncation. Full tables, mechanism and reproduction:
+the cheap production setting is `-ctk q8_0 -ctv q4_0`. Full tables, mechanism
+and reproduction:
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 
 ## Repository layout
@@ -527,11 +536,13 @@ a stable interface, not a claim of production readiness.
   perplexity 16.8 → 6486 at k=2). Use `k = r` + `quant_bits=8` there (~52%
   storage, +2% ppl) and reserve aggressive ratios for hybrid models where only
   the full-attention layers carry a codec.
-- **Not a better KV quantizer than llama.cpp's.** At equal bytes, `q8_0` beats
-  both usable tiers (truncation, and lossless-basis + int8: +0.05% vs +0.38%
-  ppl); 4-bit V is nearly free while 4-bit K is the only cliff. The codec is a
-  sequence-axis storage experiment, not a drop-in replacement for `-ctk/-ctv` —
-  see [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+- **Not a better KV quantizer than llama.cpp's — as an archive format.** At
+  equal bytes (truncation, and lossless basis + `quant_bits=8`: +0.05% vs
+  +0.38% ppl); 4-bit V is nearly free while 4-bit K is the only cliff. The
+  *transform* is another matter: give the coefficients ggml's per-32 absmax and
+  it wins 5×/7× at 8/4 bits with the same reconstruction error — measured in HF,
+  not yet confirmed in llama.cpp. See
+  [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 - Same lineage as the v4.2 prototypes inside
   [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
   (there: per-position view semantics for cross-layer KV reuse; here:

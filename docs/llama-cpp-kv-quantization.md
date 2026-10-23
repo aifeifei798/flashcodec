@@ -7,18 +7,27 @@ Measured 2026-10-23 on **Qwen3-0.6B** (28 layers, 8 KV heads, head_dim 128, i.e.
 ## TL;DR
 
 llama.cpp's own `-ctk q8_0` reaches **~53% of fp16 KV bytes at +0.05% perplexity**.
-Both usable flashcodec tiers lose against it at equal bytes:
+Two usable flashcodec **archive** tiers lose against it at equal bytes:
 
 | flashcodec tier | bytes | damage at equal bytes vs `q8_0` |
 |---|---|---|
 | truncation (`k < r`) | 25–75% | **2.7× more bytes for the same damage**; `k=2` is unusable |
 | lossless basis + `quant_bits=8` | 50% | **8× more damage** (+0.38% vs +0.05%) |
 
-So the seq-axis DCT codec is **not** a drop-in improvement over llama.cpp's
-row-wise KV quantization, and stacking the two does not help either: applied on
-top of `q8_0` it reclaims 0.8% of the bytes for 63% more damage (§3). What the
-measurements *do* show is that K and V are not equally sensitive, which changes
-how a KV budget should be spent.
+Stacking the codec on top of llama.cpp's quantizer does not help either: on
+`q8_0` it reclaims 0.8% of the bytes for 63% more damage (§3).
+
+**But the loss is the coefficient quantizer, not the transform.** The archive
+above stores one fp32 scale per frequency row (128 values). Give the coefficients
+the same per-32 absmax that ggml uses — identical bytes — and the ordering flips:
+**5× less perplexity damage at 8 bits and 7× less at 4 bits (§5)**, with the
+*reconstruction error unchanged*. The gain is error shaping (the error lands in
+the slowly-varying subspace, which softmax barely sees), not a better K. That
+result is HF-measured and still needs confirming inside llama.cpp; it does not
+make 4-bit K usable on this model (ppl 41.6 vs 18.6).
+
+Finally, K and V are not equally sensitive, which changes how a KV budget should
+be spent.
 
 ## 1. llama.cpp KV types (the target to beat)
 
@@ -145,7 +154,64 @@ argument rests on.
    cache encodes structurally: `llama_kv_cache_dsv4` keeps a **compressed K-only**
    tier and leaves V alone.
 
-## 5. What this means for flashcodec
+## 5. Where the transform does win: the same quantizer on coefficients
+
+§2–§4 tested flashcodec's *own* archive format, whose coefficient quantizer
+stores one fp32 scale per (block, frequency) row, i.e. one per 128 values. That
+is coarser than ggml's per-32 absmax. Feeding the same per-32 quantizer to the
+coefficients instead (lossless basis, `k = r`, so the byte count is **identical**
+to the same ggml type on raw rows) flips the result:
+
+fp16 model, 1024-token windows scored on the last 512 (baseline ppl 18.59, close
+to llama.cpp's 19.60):
+
+| tier | ppl | Δ | of fp16 |
+|---|---|---|---|
+| f16 | 18.5913 | — | 100% |
+| `q8_0` K+V (raw rows) | 18.7294 | +0.1382 | 53.12% |
+| dct b8 + q8 K, q8 V | 18.6501 | +0.0588 | 53.12% |
+| dct b16 + q8 K, q8 V | 18.6282 | +0.0369 | 53.12% |
+| **dct b32 + q8 K, q8 V** | **18.6192** | **+0.0279** | **53.12%** |
+| `q4_0` K+V (raw rows) | 186.83 | +168.24 | 28.12% |
+| dct b16 + q4 K, q4 V | 64.33 | +45.74 | 28.12% |
+| dct b32 + q4 K, q4 V | 47.83 | +29.24 | 28.12% |
+| dct b32 + q4 K, q4 V (K only dct) | 41.61 | +23.01 | 28.12% |
+
+At **identical bytes**: 5× less perplexity damage at 8 bits, and 7× less at
+4 bits. Replicated on disjoint 512-token windows (`q8_0` +0.3595 vs
+dct b32 +0.0536; `q4_0` 196.3 vs 46.8). Block 32 > 16 > 8 in both regimes.
+
+### It is error shaping, not better reconstruction
+
+Measured on real K rows (Qwen3-0.6B, layer 0/6/12/18/24), the **reconstruction
+error is the same** for both quantizers:
+
+| variant | rel-L2 | max abs err |
+|---|---|---|
+| raw q8 | 0.0111–0.0124 | 0.17–1.70 |
+| dct b32 + q8 | 0.0110–0.0118 | 0.19–1.65 |
+
+So the transform does not preserve K better; it moves the quantization error
+into the low-frequency (slowly varying along positions) subspace. A logit offset
+that is nearly constant across neighbouring positions is close to invisible to
+softmax — only the error that changes the *relative* ordering of positions
+costs perplexity. Hence the same L2 error and a much smaller ppl cost, and hence
+also why larger blocks (finer frequency resolution) keep improving the result.
+
+### What this does and does not change
+
+- It **does not** rescue 4-bit: ppl 41.6 vs 18.6 is still a broken model, even
+  though the damage is 7× smaller than `q4_0`.
+- It **does** mean the seq-axis transform is a legitimate quantizer front-end
+  (coefficient-domain steps matched to frequency), not just a truncation scheme.
+  At 8 bits the absolute headroom is small because `q8_0` is already nearly
+  free, so the value only shows up in regimes where the byte budget is tighter.
+- It is measured in HF, not in llama.cpp, and this harness's absolute damage is
+  larger than llama.cpp's real `q8_0` (+0.74% vs +0.05% at a comparable
+  baseline). A llama.cpp implementation is needed before quoting it as a win
+  there; a larger model is needed before claiming it makes 4-bit K usable.
+
+## 6. What this means for flashcodec
 
 - The library's value is **storage-side research on the sequence axis**, not a
   production KV-cache replacement for llama.cpp. The honest framing is the one
@@ -159,7 +225,7 @@ argument rests on.
   simply: `-ctk q8_0 -ctv q4_0` (40.6% of fp16 KV, +0.28% ppl), never
   `-ctk q4_0`.
 
-## 6. Limitations
+## 7. Limitations
 
 - One model (Qwen3-0.6B), one context length (512). Longer contexts usually make
   KV quantization *more* damaging, but they should not reorder DCT vs row
@@ -173,7 +239,7 @@ argument rests on.
   for large models at very long context — where `q8_0` K + `q4_0` V is still the
   cheaper answer.
 
-## 7. Reproduce
+## 8. Reproduce
 
 ```bash
 # convert (needs the `gguf` + `sentencepiece` python packages)

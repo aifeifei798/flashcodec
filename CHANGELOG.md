@@ -26,6 +26,14 @@ placeholder package).
   lossless-basis int8 archive is *larger* than the 4-bit payload it replaces
   (39.8% vs 28.1%). Truncation on top of either quantizer stays catastrophic:
   the two compression stages are not complementary.
+- Same doc, §5: the coefficient-domain quantizer flips the result. Giving the
+  DCT coefficients ggml's per-32 absmax (lossless basis, identical byte count)
+  instead of this library's per-frequency-row scale reduces the perplexity
+  damage 5× at 8 bits (fp16, 1024-token windows: +0.028 vs +0.138) and 7× at
+  4 bits (ppl 41.6 vs 186.8) with the *reconstruction error unchanged* — the
+  transform shapes the error into the slowly-varying subspace that softmax
+  barely sees. HF-measured, not yet confirmed in llama.cpp; 4-bit K remains
+  unusable on this model.
 
 ## [1.0.0] — 2026-10-23
 

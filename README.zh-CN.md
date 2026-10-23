@@ -401,7 +401,7 @@ llama.cpp `184f65360`、CUDA + FA）：
 | `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
 | `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
 
-对着这条线，flashcodec 在同字节下**没有优势**：
+对着这条线，flashcodec **当前归档格式**在同字节下没有优势：
 
 - **截断（`k < r`）**：K 上 `jpeg k=4`（75% 的 fp16 K 字节）与全量 `q4_0`
   （28% 的 fp16 KV 字节）损伤相同 —— 同等损伤多用 2.7× 字节；密集模型上 `k=2` 不可用。
@@ -411,10 +411,15 @@ llama.cpp `184f65360`、CUDA + FA）：
   字节（每 128 个值一个 scale，而非每 32 个一个），代价是损伤 +63%；在 `q4_0`
   之上，int8 系数归档比它替换掉的 4-bit 载荷**更大**（39.8% vs 28.1%）。
 
+**输的是系数量化粒度，不是变换本身。** 给系数用与 ggml 相同的每 32 值 absmax
+（无损基、字节数完全相同），排序就反过来：**8-bit 下困惑度损伤少 5×、4-bit 下少 7×**，
+而重构误差**一模一样** —— 变换只是把量化误差挪到位置间缓变（低频）子空间，
+softmax 几乎看不见（误差整形，不是更好的 K）。该结果在 HF 侧测得，仍需在
+llama.cpp 内确认；它也不能让本模型的 4-bit K 变得可用（ppl 41.6 vs 18.6）。
+
 实测还显示 K 与 V 不对称：4-bit **K** 是唯一的悬崖（只压 K 到 `q4_0` → +237%），
-4-bit V 几乎免费（+0.29%）。所以生产上便宜的配置是 `-ctk q8_0 -ctv q4_0`；
-未来 codec 若要继续竞争，目标只能是 **K 的 25% 字节**，且要靠沿 head_dim 的
-旋转 / 逐通道量化，而不是系数截断。完整表格、机理与复现：
+4-bit V 几乎免费（+0.29%）。所以生产上便宜的配置是 `-ctk q8_0 -ctv q4_0`。
+完整表格、机理与复现：
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 
 ## 目录结构
@@ -478,10 +483,12 @@ python tests/test_attention.py      # 系数域解码 attention 与物化路径�
   Qwen3-0.6B 困惑度 16.8 → 6486 @ k=2）。这种模型请用 `k = r` +
   `quant_bits=8`（约 52% 存储，+2% ppl）；激进压缩比留给混合架构（只有
   full_attention 层挂 codec 的情形）。
-- **不是 llama.cpp KV 量化的更优替代**：同字节下 `q8_0` 赢过两个可用档位
-  （截断；以及无损基 + int8，+0.05% vs +0.38% ppl）；4-bit V 几乎免费，
-  4-bit K 是唯一悬崖。本库是 seq 轴上的存储研究，不是 `-ctk/-ctv` 的替换品，
-  详见 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
+- **不是 llama.cpp KV 量化的更优替代 —— 至少不是当前归档格式**：同字节下
+  `q8_0` 赢过两个可用档位（截断；以及无损基 + int8，+0.05% vs +0.38% ppl）；
+  4-bit V 几乎免费，4-bit K 是唯一悬崖。但**变换本身**是另一回事：把系数交给
+  ggml 式的每 32 值 absmax 后，8-bit / 4-bit 分别赢 5× / 7×，且重构误差不变
+  —— 该结果在 HF 侧测得，尚未在 llama.cpp 内确认。详见
+  [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 - 与 [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
   中 v4.2 原型（模型内 KV 复用层的 DCT/差分读取）同源：那里是"每位置视图"
   语义，这里是标准 cache 存储语义。
