@@ -30,16 +30,20 @@ make 4-bit K usable on this model (ppl 41.6 vs 18.6).
 `q4_0` KV config costs +0.39% at 8k context and +0.20% at 32k — the small-model
 cliff (+236% on 0.6B) does not exist at production scale (§6), and the 4-bit KL
 there is 0.0035, so there is nothing to fix. On the 0.6B it is already broken.
-Both ends leave the transform without a job; the dense mid-size case below is
-the only remaining opening.
+Both ends leave the transform without a job; only the dense mid-size case was
+still open, and §8 closes it.
 
-**The one place it could matter** is a dense mid-size model, where 4-bit is
-costly but not fatal: Gemma4-12B (48 layers, SWA + 8 global MQA layers) shows
-KL 0.30 at 4 bits vs 0.17 at 8 bits with top-1 agreement 89% (§7) — 86× more
-distortion than the 27B hybrid, because every layer reads the quantized cache.
-Perplexity is unusable there (four corpora give baselines of 302 / 355 / 2.24 /
-18.87 and the sign of the effect flips), so that section is measured with
-`--kl-divergence` instead.
+**Dense mid-size models are where 4-bit KV is costly but not fatal** — and where
+perplexity stops working as a metric. Gemma4-12B (48 layers, 40 SWA + 8 global
+MQA) measured with `--kl-divergence`: KL 0.17 at 8 bits, 0.30 at 4 bits, top-1
+agreement 89%. Its ppl ranges from 2.2 to 355 depending on the corpus and
+sometimes *improves* under quantization, so KL is the only usable metric there.
+
+**But the HF-side KL pre-judgment kills the follow-up** (§8): at equal bytes the
+transform helps only where row quantization is already destructive
+(Qwen3-0.6B: 3× lower KL at 8 bits), and is neutral at 8 bits / **worse at
+4 bits** on Hy-MT2-1.8B and Gemma4-E2B. There is no operating point where it is
+worth implementing, so **no llama.cpp integration follows from this**.
 
 Finally, K and V are not equally sensitive, which changes how a KV budget should
 be spent.
@@ -309,27 +313,70 @@ Capacity is still not the motivator here: Gemma4-12B keeps ~32 KiB of KV per
 token in its 8 global layers and its 40 SWA layers are capped at the 1024-token
 window, so 8k context costs ~0.9 GiB — there is no byte pressure to relieve.
 
-## 8. What this means for flashcodec
+## 8. HF-side KL pre-judgment across model sizes
 
-- The seq-axis transform is a **real distortion win at equal bytes** (5× at
-  8 bits, 7× at 4 bits, §5), but as a *coefficient-domain* transform with
-  ggml-style per-32 scales, not as this library's archive format, and it is
-  still HF-measured only.
-- The only defensible target is a **dense mid-size model**: Gemma4-12B is where
-  4-bit KV first costs something real (KL 0.30, top-1 agreement 89%, §7) without
-  being a collapse. Applying the §5 transform to that regime is the one
-  experiment that could turn this into a feature; hybrid models (27B) do not
-  need it, and 0.6B is already broken at that ratio.
+Before writing anything into llama.cpp, the same A/B was run inside HF
+(`kv_probe_kl.py`): 16 windows x 1024 tokens, scored on the last 512, fp16,
+wikitext, metric = mean KL(tier || f16) and top-1 agreement. Equal-byte pairs
+are adjacent rows.
+
+| model | tier | KL | top-1 | of fp16 |
+|---|---|---|---|---|
+| Qwen3-0.6B (28 layers, 8 KV heads) | `q8_0` K+V | 0.0168 | 93.8% | 53.1% |
+| | dct b32 + q8 K+V | **0.0056** | **95.8%** | 53.1% |
+| | `q4_0` K+V | 2.3752 | 33.2% | 28.1% |
+| | dct b32 + q4 K+V | 1.0283 | 53.0% | 28.1% |
+| Hy-MT2-1.8B (32 layers, 4 KV heads) | `q8_0` K+V | 0.0002 | 99.4% | 53.1% |
+| | dct b32 + q8 K+V | 0.0003 | 99.2% | 53.1% |
+| | `q4_0` K+V | 0.0364 | 90.4% | 28.1% |
+| | dct b32 + q4 K+V | 0.0968 | 85.0% | 28.1% |
+| Gemma4-E2B (35 layers, 7 full + 28 SWA, 1 KV head) | `q8_0` K+V | 0.0025 | 98.3% | 22.8% |
+| | dct b32 + q8 K+V | 0.0028 | 98.1% | 22.8% |
+| | `q4_0` K+V | 0.2788 | 79.7% | 12.1% |
+| | dct b32 + q4 K+V | 0.3301 | 78.8% | 12.1% |
+
+Reading:
+
+- The transform wins **only where raw row quantization is already destructive**
+  (0.6B): 3x lower KL at 8 bits, 2.3x at 4 bits — and even there 4-bit stays
+  broken (KL 1.03, top-1 53%).
+- On the two larger models it is **neutral at 8 bits and worse at 4 bits**
+  (2.7x KL on Hy-MT2, +18% on Gemma4-E2B), because there is nothing to fix:
+  `q8_0` is already ~0 and `q4_0` is tolerable.
+- The mechanism of §5 is real, but it only acts on a distortion that exists at
+  small scale. In the regimes where the transform would be worth implementing,
+  it has no room; where it has room, the model is already unusable.
+
+**Verdict: do not implement this in llama.cpp** (no S2, no kernel). The cheap
+pre-judgment answers the question in an afternoon instead of a week.
+
+Caveats: 8k scored tokens per model; the harness keeps the full 1024-token
+history for SWA layers (no window cropping), so the byte ratios are relative to
+an uncropped fp16 cache; the checkpoints are finetunes and the DCT is applied to
+every layer.
+
+## 9. What this means for flashcodec
+
+- The seq-axis transform is a **real distortion win at equal bytes**, but only
+  where row quantization is already destructive: 3× lower KL at 8 bits and 2.3×
+  at 4 bits on Qwen3-0.6B, and **neutral at 8 bits / worse at 4 bits** on
+  1.8–2B models that quantize cleanly (§8). Combined with 4-bit still being
+  broken at 0.6B (KL 1.03, top-1 53%), there is no operating point where the
+  codec is worth shipping: **no llama.cpp implementation follows from this.**
+- What the exercise did produce is a set of transferable measurements:
+  the coefficient quantizer, not the transform, decides the earlier verdict
+  (§5); the error is redistributed rather than reduced (§5); perplexity and KL
+  disagree about which side (K or V) matters (§7); and KV-quantization damage is
+  driven by architectural exposure more than by parameter count (§6–§7).
 - **Metric discipline**: use KL / top-1 agreement (`--kl-divergence`) for
   finetuned or dense models — their ppl is a calibration artifact and sometimes
   *improves* under quantization. ppl is only informative on base models with a
   sane baseline (the 0.6B and 27B rows).
-- Competing at 50% bytes remains pointless (`q8_0` is free there). For
-  deployment advice, the measured takeaway is `-ctk q8_0 -ctv q4_0` on base
-  models (40.6% of fp16 KV, +0.28% ppl), never `-ctk q4_0` on a small dense
-  model.
+- Deployment advice is unchanged and now has a calibration-free backing:
+  `-ctk q8_0 -ctv q4_0` on base models (40.6% of fp16 KV), never `-ctk q4_0` on
+  a small dense model (KL 2.4, top-1 33% at 0.6B).
 
-## 9. Limitations
+## 10. Limitations
 
 - One model (Qwen3-0.6B), one context length (512). Longer contexts usually make
   KV quantization *more* damaging, but they should not reorder DCT vs row
@@ -343,7 +390,7 @@ window, so 8k context costs ~0.9 GiB — there is no byte pressure to relieve.
   for large models at very long context — where `q8_0` K + `q4_0` V is still the
   cheaper answer.
 
-## 10. Reproduce
+## 11. Reproduce
 
 ```bash
 # convert (needs the `gguf` + `sentencepiece` python packages)

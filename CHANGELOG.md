@@ -49,6 +49,14 @@ placeholder package).
   free either. K and V contribute equally in KL even though ppl blames V 2×.
   Same protocol on the 27B hybrid: KL 0.0021 (`q8_0`) / 0.0035 (`q4_0`) — 86×
   less distortion, because only 17 of its 64 layers read a KV cache.
+- Same doc, §8: HF-side KL pre-judgment across three models (mean KL(tier||f16),
+  top-1 agreement, 8192 scored tokens, equal-byte pairs). The transform helps
+  only where row quantization is already destructive — Qwen3-0.6B: KL 0.0168 ->
+  0.0056 at 8 bits, 2.375 -> 1.028 at 4 bits — and is neutral at 8 bits (0.0002
+  -> 0.0003) with **worse** 4-bit (0.0364 -> 0.0968) on Hy-MT2-1.8B, and neutral
+  (0.0025 -> 0.0028) with worse 4-bit (0.279 -> 0.330) on Gemma4-E2B. Verdict:
+  no operating point where the codec is worth shipping, so no llama.cpp
+  implementation follows.
 
 ## [1.0.0] — 2026-10-23
 

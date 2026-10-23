@@ -427,7 +427,12 @@ llama.cpp 内确认；它也不能让本模型的 4-bit K 变得可用（ppl 41.
 Gemma4-12B（48 层，40 SWA + 8 全局 MQA）用 `--kl-divergence` 测得：8-bit KL
 0.17、4-bit KL 0.30、top-1 一致率 89%（同一协议下 27B 混合只有 0.0035）。
 它的 ppl 随语料在 2.2–355 之间漂移，量化还常常让 ppl *变好*，所以那一档
-只能用 KL。完整表格、机理与复现：
+只能用 KL。
+
+**随后的 HF 侧 KL 预判把这最后一个方向也关掉了**：同字节下，变换只在行量化
+已经造成破坏时有效（Qwen3-0.6B：8-bit KL 低 3×，4-bit 低 2.3× 但仍然崩），
+在 Hy-MT2-1.8B 和 Gemma4-E2B 上则是 8-bit 持平、**4-bit 更差**。
+不存在值得落地的工况，因此**不跟进 llama.cpp 实现**。完整表格、机理与复现：
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 
 ## 目录结构
