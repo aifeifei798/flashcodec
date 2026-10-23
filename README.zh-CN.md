@@ -71,42 +71,128 @@ pip install -e ".[hf]"               # 或从源码安装
 PyPI 分发包名：`flashcodec-kv`，导入名仍是 `flashcodec`（PyPI 上的
 `flashcodec` 是无关占位包，别装错）。
 
-## 快速上手
+## 用法
+
+### 1. 独立使用 codec cache（不需要 transformers）
 
 ```python
 import torch
-from flashcodec import FlashCodecCache, apply_flash_codec
-
-# 1) 原生：transformers 5.x 一等公民 Cache 后端（任意 CausalLM）
-cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)  # 4×
-#    int8 系数：同样形状，归档再小 15×（quant_bits=8）
-cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2,
-                        quant_bits=8)                              # 15×
-out = model.generate(input_ids, max_new_tokens=64,
-                     past_key_values=cache, use_cache=True)
-print(cache.get_seq_length(), cache.storage_bytes())
-
-# 2) 一行热补丁：之后每次 generate() 默认走编解码缓存
-apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
-out = model.generate(input_ids, max_new_tokens=64)
-# PNG 无损档位与未打补丁模型的生成 token 逐位完全一致
-from flashcodec import remove_flash_codec
-remove_flash_codec(model)          # 随时还原默认行为
-
-# 免物化解码（系数域 attention，不构建 KV 视图）：
-apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2,
-                  quant_bits=8, materialization_free=True)
-
-# 3) 独立使用（无需 transformers）：直接操作缓存管理器
 from flashcodec import CodecKVCache
-cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
-k, v = cache.forward(k_seq, v_seq)          # 全量前向填充
-k, v = cache.decode_step(new_k, new_v)      # 增量解码
+
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2, quant_bits=8)
+k_hat, v_hat = cache.forward(k_seq, v_seq)   # 预填：(B,H,S,D) -> 重构视图
+k1, v1 = cache.decode_step(k_new, v_new)     # 追加一个 token（别名 update）
+print(cache.stats(0))        # tokens / archived / raw / storage_bytes / raw_bytes
+print(cache.storage_bytes()) # 所有层的 archive + raw 尾
 ```
 
-`FlashCodecCache` 继承 `transformers.cache_utils.Cache`（5.x layer API）：
-KV 写入与读取的替换收敛在 `cache.update(k, v, layer_idx)` 接口——零模型
-手术，任意 CausalLM（含 Llama/Qwen/Mistral 风格 GQA）通用。
+`forward` 会先重置该层再整体填充；`decode_step` 追加并在满块时归档。
+要逐位无损档位就换 `mode="png", keep_ratio=1.0`。`crop(-n)` 删除尾部 token
+（负数，遵循 HF 约定），`reorder_cache(beam_idx)` 做 beam search 的批维重排，
+`reset()` 保留已分配容量。
+
+### 2. transformers 5.x：显式传 cache
+
+```python
+from flashcodec import FlashCodecCache
+
+cache = FlashCodecCache.from_config(
+    model.config, mode="jpeg", block_size=8,
+    keep_freqs=8,      # k = r：完整 DCT 基（变换本身无损）
+    quant_bits=8)      # int8 系数 -> 约 bf16 KV 的 52%
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+
+print(cache.get_seq_length())        # prompt + new_tokens - 1
+print(cache.storage_bytes())         # codec 层：archive + raw 尾
+print(cache.codec_layer_indices())   # 例如 [3, 7, 11, 15, 19, 23]
+```
+
+`from_config` 只给 `full_attention` 层挂 codec，所以混合架构（Qwen3.5 式的
+线性注意力 + 全注意力）里的线性层保持原生；纯 decoder-only 模型则每层都压缩。
+`FlashCodecCache` 就是普通的 `transformers.cache_utils.Cache` 子类（5.x layer
+API），`update` / `get_seq_length` / `crop` / `reorder_cache` 与原生 cache 同语义。
+
+### 3. 一行热补丁
+
+```python
+from flashcodec import apply_flash_codec, remove_flash_codec
+
+apply_flash_codec(model, mode="jpeg", block_size=8,
+                  keep_freqs=8, quant_bits=8)
+out = model.generate(input_ids, max_new_tokens=64)   # 自动注入 codec cache
+remove_flash_codec(model)                            # 还原系统默认 cache
+```
+
+可用参数：`keep_freqs`（jpeg）、`keep_ratio`（png）、`quant_bits`（`0` 或 `8`）、
+`per_layer={idx: {...}}`（校准过的逐层预算）、`materialization_free=True`（见第 5 节）。
+
+### 4. 档位怎么选
+
+| 目标 | 配置 | 存储（bf16 KV） | 代价 |
+|---|---|---|---|
+| 输出逐位一致 | `mode="png", keep_ratio=1.0` | ~1.9× | 只花存储（fp32 差分） |
+| **安全默认** | `mode="jpeg", keep_freqs=8, quant_bits=8` | ~52% | 稠密模型 +2% ppl；混合模型 token 100% 一致 |
+| 激进（压缩层数少时） | `keep_freqs=2` / `4` | 25–50% | 截断误差逐层累积 |
+| 极限 | `keep_freqs=2, quant_bits=8` | ~13% | 稠密模型直接崩 |
+
+经验规则：`keep_freqs = block_size`（完整 DCT 基）+ `quant_bits=8` 是唯一在
+**每层**都稳的有损设置。`keep_freqs < block_size` 只在挂 codec 的层数很少
+（混合架构）时划算；逐档实测表见[基准](#基准实测b2-h8-s2048-d64随机游走自相关信号fp32)。
+
+### 5. 免物化解码（不构建 KV 视图）
+
+```python
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=8,
+                  quant_bits=8, materialization_free=True)
+out = model.generate(input_ids, max_new_tokens=64)
+
+from flashcodec import codec_attention_stats
+print(codec_attention_stats(model))   # 被包装的 attention 模块数（0 = 未启用）
+```
+
+decode step 直接用 Triton split-K kernel 在存储行上算 attention，并且释放
+prefill 的重构视图，稳态显存只剩归档。该 patch 有守卫（单 token、batch=1、
+eval、非滑窗、标准 `position_embeddings`），不满足会静默回退。
+
+### 6. 诊断
+
+| 调用 | 返回 |
+|---|---|
+| `cache.stats(layer)` | `tokens / archived / raw / storage_bytes / raw_bytes` |
+| `cache.storage_bytes(layer=None)` | archive + raw 尾字节数（不含倍增预留容量与重构视图） |
+| `cache.codec_layer_indices()` | 真正挂 codec 的层 |
+| `codec_attention_stats(model)` | 被包装的 attention 模块数（`0` = 未启用） |
+| `HAS_HF_CACHE` | transformers 后端是否可导入 |
+
+### 7. Codec 级 API（不经过 cache）
+
+```python
+from flashcodec import JPEGCodec, PNGCodec
+
+codec = JPEGCodec(block_size=8, keep_freqs=2, quant_bits=8)
+coeffs = codec.compress(k_seq)              # (..., n_blocks, k, D)
+q, scale = codec.quantize(coeffs)           # int8 + 每（块, 频率）scale
+k_hat = codec.decompress(q, scales=scale)   # (..., S, D)，输入 dtype
+
+png = PNGCodec(block_size=8, keep_ratio=1.0)
+delta, anchor = png.filter(k_seq)
+k_hat = png.reconstruct(delta, anchor)
+```
+
+张量契约：`(B, H, S, D)`，压缩轴 `dim=-2`。函数式 API（`dct_compress`、
+`dct_decompress`、`quantize_coeffs`、`dequantize_coeffs`、`png_filter`、
+`png_reconstruct`、`dct_basis`）同样导出。
+
+### 8. 常见坑
+
+- `pip install flashcodec-kv`，但 `import flashcodec` —— PyPI 名是分发包名，不是模块名。
+- 从源码目录运行时，`import flashcodec` 必须解析到包目录而不是同名项目目录
+  （`pip install -e .`，或进到项目目录里运行）。
+- `crop` 收**负数**（`cache.crop(-4)` 删掉尾部 4 个 token）。
+- beam search 各档都能用，但只有 `png keep_ratio=1.0` 与未打补丁模型逐位一致。
+- `materialization_free=True` 只支持 decode 且 batch=1；批量/padding 推理会自动回退。
+- `quant_bits` 只对 jpeg 有效（png 无损档必须保留 fp32 差分）。
 
 ## Transformers 集成（Qwen3.5-0.8B 实战验证）
 

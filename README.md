@@ -82,43 +82,137 @@ Distribution name is `flashcodec-kv`; the import name stays `flashcodec`. (The
 bare `flashcodec` name on PyPI belongs to an unrelated placeholder package, so
 don't `pip install flashcodec`.)
 
-## Quick start
+## Usage
+
+### 1. Standalone codec cache (no transformers)
 
 ```python
 import torch
-from flashcodec import FlashCodecCache, apply_flash_codec
-
-# 1) Native: a first-class transformers 5.x Cache backend (any CausalLM)
-cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2)  # 4×
-#    int8 coefficients: same shape, 15× smaller archive (quant_bits=8)
-cache = FlashCodecCache(mode="jpeg", block_size=8, keep_freqs=2,
-                        quant_bits=8)                              # 15×
-out = model.generate(input_ids, max_new_tokens=64,
-                     past_key_values=cache, use_cache=True)
-print(cache.get_seq_length(), cache.storage_bytes())
-
-# 2) One-line hot patch: every generate() defaults to the codec cache
-apply_flash_codec(model, mode="png", block_size=8, keep_ratio=1.0)
-out = model.generate(input_ids, max_new_tokens=64)
-# PNG lossless tier reproduces the unpatched model's tokens EXACTLY
-from flashcodec import remove_flash_codec
-remove_flash_codec(model)          # restore default behavior
-
-# Materialization-free decode (coefficient-domain attention, no KV view):
-apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=2,
-                  quant_bits=8, materialization_free=True)
-
-# 3) Standalone (no transformers needed): direct cache manager
 from flashcodec import CodecKVCache
-cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2)
-k, v = cache.forward(k_seq, v_seq)          # full-sequence fill
-k, v = cache.decode_step(new_k, new_v)      # incremental decode
+
+cache = CodecKVCache(mode="jpeg", block_size=8, keep_freqs=2, quant_bits=8)
+k_hat, v_hat = cache.forward(k_seq, v_seq)   # prefill: (B,H,S,D) -> reconstructed view
+k1, v1 = cache.decode_step(k_new, v_new)     # one new token (alias: update)
+print(cache.stats(0))        # tokens / archived / raw / storage_bytes / raw_bytes
+print(cache.storage_bytes()) # archive + raw tail, all layers
 ```
 
-`FlashCodecCache` subclasses `transformers.cache_utils.Cache` (5.x layer
-API): write/read replacement is converged at the `cache.update(k, v,
-layer_idx)` interface — zero model surgery, works with any CausalLM
-(Llama/Qwen/Mistral-style GQA included).
+`forward` resets that layer and refills it; `decode_step` appends and archives
+whole blocks. Switch to `mode="png", keep_ratio=1.0` for the bitwise-lossless
+tier. `crop(-n)` removes trailing tokens (negative count, HF convention),
+`reorder_cache(beam_idx)` does the beam-search gather, `reset()` keeps the
+allocated capacity.
+
+### 2. transformers 5.x: pass the cache explicitly
+
+```python
+from flashcodec import FlashCodecCache
+
+cache = FlashCodecCache.from_config(
+    model.config, mode="jpeg", block_size=8,
+    keep_freqs=8,      # k = r: full DCT basis (lossless transform)
+    quant_bits=8)      # int8 coefficients -> ~52% of bf16 KV
+out = model.generate(input_ids, max_new_tokens=64,
+                     past_key_values=cache, use_cache=True)
+
+print(cache.get_seq_length())        # prompt + new_tokens - 1
+print(cache.storage_bytes())         # codec layers: archive + raw tail
+print(cache.codec_layer_indices())   # e.g. [3, 7, 11, 15, 19, 23]
+```
+
+`from_config` attaches a codec only to `full_attention` layers, so hybrid models
+(Qwen3.5-style linear + full attention) keep the linear layers native; on a
+plain decoder-only model every layer is compressed. `FlashCodecCache` is a
+regular `transformers.cache_utils.Cache` subclass (5.x layer API), so
+`update` / `get_seq_length` / `crop` / `reorder_cache` behave like the native
+cache.
+
+### 3. One-line hot patch
+
+```python
+from flashcodec import apply_flash_codec, remove_flash_codec
+
+apply_flash_codec(model, mode="jpeg", block_size=8,
+                  keep_freqs=8, quant_bits=8)
+out = model.generate(input_ids, max_new_tokens=64)   # codec cache injected
+remove_flash_codec(model)                            # back to the stock cache
+```
+
+Accepted kwargs: `keep_freqs` (jpeg), `keep_ratio` (png), `quant_bits`
+(`0` or `8`), `per_layer={idx: {...}}` for a calibrated per-layer budget, and
+`materialization_free=True` for the decode path below.
+
+### 4. Picking a tier
+
+| goal | config | storage (bf16 KV) | cost |
+|---|---|---|---|
+| bitwise-identical output | `mode="png", keep_ratio=1.0` | ~1.9× | storage only (fp32 deltas) |
+| **safe default** | `mode="jpeg", keep_freqs=8, quant_bits=8` | ~52% | +2% ppl on a dense model, 100% token match on the hybrid model |
+| aggressive (few layers compressed) | `keep_freqs=2` / `4` | 25–50% | truncation compounds per layer |
+| maximum | `keep_freqs=2, quant_bits=8` | ~13% | collapses on dense models |
+
+Rule of thumb: `keep_freqs = block_size` (full DCT basis) + `quant_bits=8` is
+the only lossy setting that stays close on **every** layer. `keep_freqs <
+block_size` only pays off when few layers carry a codec (hybrid models); the
+measured per-tier tables are in [Benchmarks](#benchmarks-measured-b2-h8-s2048-d64-random-walk-autocorrelated-signal-fp32).
+
+### 5. Materialization-free decode (no KV view)
+
+```python
+apply_flash_codec(model, mode="jpeg", block_size=8, keep_freqs=8,
+                  quant_bits=8, materialization_free=True)
+out = model.generate(input_ids, max_new_tokens=64)
+
+from flashcodec import codec_attention_stats
+print(codec_attention_stats(model))   # wrapped attention modules (0 = patch off)
+```
+
+Decode steps attend on the stored DCT rows with the Triton split-K kernel, and
+the prefill view is released, so steady-state memory is the archive only. The
+patch is guarded (single-token, batch=1, eval, no sliding window, standard
+`position_embeddings`) and silently falls back otherwise.
+
+### 6. Diagnostics
+
+| call | returns |
+|---|---|
+| `cache.stats(layer)` | `tokens / archived / raw / storage_bytes / raw_bytes` |
+| `cache.storage_bytes(layer=None)` | archive + raw tail bytes (excludes reserved capacity and the reconstructed view) |
+| `cache.codec_layer_indices()` | layers that actually carry a codec |
+| `codec_attention_stats(model)` | number of wrapped attention modules (`0` = patch off) |
+| `HAS_HF_CACHE` | whether the transformers backend is importable |
+
+### 7. Codec-level API (no cache)
+
+```python
+from flashcodec import JPEGCodec, PNGCodec
+
+codec = JPEGCodec(block_size=8, keep_freqs=2, quant_bits=8)
+coeffs = codec.compress(k_seq)              # (..., n_blocks, k, D)
+q, scale = codec.quantize(coeffs)           # int8 + per-(block, freq) scale
+k_hat = codec.decompress(q, scales=scale)   # (..., S, D), input dtype
+
+png = PNGCodec(block_size=8, keep_ratio=1.0)
+delta, anchor = png.filter(k_seq)
+k_hat = png.reconstruct(delta, anchor)
+```
+
+Tensor contract: `(B, H, S, D)`, compression axis `dim=-2`. The functional API
+(`dct_compress`, `dct_decompress`, `quantize_coeffs`, `dequantize_coeffs`,
+`png_filter`, `png_reconstruct`, `dct_basis`) is exported too.
+
+### 8. Pitfalls
+
+- `pip install flashcodec-kv`, but `import flashcodec` — the PyPI name is the
+  distribution, not the module.
+- From a source checkout, `import flashcodec` must resolve to the package dir,
+  not the project dir of the same name (`pip install -e .`, or run inside it).
+- `crop` takes a **negative** count (`cache.crop(-4)` removes 4 trailing tokens).
+- Beam search works on every tier, but only `png keep_ratio=1.0` is
+  bitwise-identical to the unpatched model.
+- `materialization_free=True` is decode-only and batch=1; batched/padded
+  generation falls back automatically.
+- `quant_bits` is jpeg-only (the png lossless tier must keep fp32 deltas).
 
 ## Transformers integration (real-world tested on Qwen3.5-0.8B)
 
