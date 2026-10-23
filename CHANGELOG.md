@@ -20,6 +20,12 @@ placeholder package).
   behind the recommended `K=q8_0 + V=q4_0` (40.6% of fp16, +0.28% ppl) and why
   4-bit K is the only cliff. README gains a matching section and Boundaries
   bullet; no code or API change.
+- Same doc, §3: stacking the codec **on top of** llama.cpp's own KV
+  quantization (64 × 512 wikitext windows). On `q8_0` the codec reclaims 0.8%
+  (K) / 1.6% (K+V) of the bytes while the damage grows 1.6–2.3×; on `q4_0` a
+  lossless-basis int8 archive is *larger* than the 4-bit payload it replaces
+  (39.8% vs 28.1%). Truncation on top of either quantizer stays catastrophic:
+  the two compression stages are not complementary.
 
 ## [1.0.0] — 2026-10-23
 

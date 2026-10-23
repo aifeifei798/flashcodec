@@ -15,8 +15,10 @@ Both usable flashcodec tiers lose against it at equal bytes:
 | lossless basis + `quant_bits=8` | 50% | **8× more damage** (+0.38% vs +0.05%) |
 
 So the seq-axis DCT codec is **not** a drop-in improvement over llama.cpp's
-row-wise KV quantization. What the measurements *do* show is that K and V are
-not equally sensitive, which changes how a KV budget should be spent.
+row-wise KV quantization, and stacking the two does not help either: applied on
+top of `q8_0` it reclaims 0.8% of the bytes for 63% more damage (§3). What the
+measurements *do* show is that K and V are not equally sensitive, which changes
+how a KV budget should be spent.
 
 ## 1. llama.cpp KV types (the target to beat)
 
@@ -75,7 +77,52 @@ Absolute perplexities in the two tables are not comparable (HF runs disjoint
 windows in bf16, llama.cpp runs contiguous chunks in fp16); only the relative
 damage is.
 
-## 3. Why the codec loses
+## 3. Stacking the codec on top of llama.cpp's quantization
+
+If llama.cpp already stores quantized KV, the natural follow-up is whether the
+codec can compress *those* values further. Same harness (64 × 512 wikitext
+windows): the row quantizer runs first, the codec sees the dequantized rows, and
+the byte count is the codec archive alone — the quantized values are replaced,
+not stored twice.
+
+| stack | ppl | Δ vs f16 | of fp16 |
+|---|---|---|---|
+| f16 | 27.9690 | — | 100% |
+| `q8_0` K+V | 28.2485 | +1.00% | 53.12% |
+| `q8_0` + dct b32/k32 int8 on K | 28.4259 | +1.63% | 52.34% |
+| `q8_0` + dct b8/k8 int8 on K | 28.5795 | +2.18% | 52.34% |
+| `q8_0` + dct b8/k8 int8 on K+V | 28.6244 | +2.34% | 51.56% |
+| `q8_0` + dct b8/k4 on K | 160.59 | +474% | 51.56% |
+| `q8_0` + dct b8/k2 on K | 2763.8 | +9781% | 39.06% |
+| `q4_0` K+V | 201.95 | +622% | 28.12% |
+| `q4_0` + dct b8/k8 int8 on K | 211.70 | +657% | 39.84% |
+| `q4_0` + dct b8/k4 on K | 1195.1 | +4173% | 39.06% |
+| `q4_0` + dct b8/k2 int8 on K | 5831.6 | +20751% | 20.51% |
+| `q4_0` + dct b8/k2 int8 on K+V | 42085 | +150371% | 12.89% |
+
+Reading:
+
+- **On top of `q8_0` the codec can only reclaim the scale overhead** — one
+  fp32 scale per 128 coefficient values instead of one fp16 scale per 32 raw
+  values. That is 0.78% of the total bytes on K (52.34% vs 53.12%) and 1.56% on
+  K+V, while the damage grows 1.6–2.3×. Strictly dominated.
+- **On top of `q4_0` it is worse than useless.** An int8 coefficient archive is
+  ~1 B/value, i.e. *larger* than the 0.5625 B/value it replaces, so the
+  lossless-basis stack actually costs **more** bytes (39.84% vs 28.12%) for a
+  worse model. Only aggressive truncation gets back under 4 bits, and those rows
+  (20.5% at ppl 5831, 12.9% at ppl 42085) are broken models, not compressions.
+- **The two stages are not complementary.** Both spend the same budget on the
+  same information (K), and llama.cpp's per-32 absmax is already the cheaper way
+  to spend it; putting an orthonormal transform in front only moves the error
+  around and adds a second source of it.
+
+The base quantizer here is an emulation in bf16 (symmetric absmax per 32 head
+dims, applied to K and V), so its absolute damage is harsher than the real
+`-ctk q8_0` (+1.0% vs +0.05% in §1: the emulation also quantizes V, which the
+real configuration does not). The ordering, and every byte count, is what the
+argument rests on.
+
+## 4. Why the codec loses
 
 1. **Truncation deletes variance, quantization only adds noise.** `dct k=4`
    (half the coefficients kept, 75% of fp16 K bytes) damages as much as
@@ -98,7 +145,7 @@ damage is.
    cache encodes structurally: `llama_kv_cache_dsv4` keeps a **compressed K-only**
    tier and leaves V alone.
 
-## 4. What this means for flashcodec
+## 5. What this means for flashcodec
 
 - The library's value is **storage-side research on the sequence axis**, not a
   production KV-cache replacement for llama.cpp. The honest framing is the one
@@ -112,7 +159,7 @@ damage is.
   simply: `-ctk q8_0 -ctv q4_0` (40.6% of fp16 KV, +0.28% ppl), never
   `-ctk q4_0`.
 
-## 5. Limitations
+## 6. Limitations
 
 - One model (Qwen3-0.6B), one context length (512). Longer contexts usually make
   KV quantization *more* damaging, but they should not reorder DCT vs row
@@ -126,7 +173,7 @@ damage is.
   for large models at very long context — where `q8_0` K + `q4_0` V is still the
   cheaper answer.
 
-## 6. Reproduce
+## 7. Reproduce
 
 ```bash
 # convert (needs the `gguf` + `sentencepiece` python packages)

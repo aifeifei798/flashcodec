@@ -448,6 +448,10 @@ Against that bar, flashcodec does **not** win at equal bytes:
   same damage; `k=2` is unusable on dense models.
 - **lossless basis + `quant_bits=8`** (≈50% of fp16 bytes): +0.38% ppl at
   b32/k32, versus +0.05% for `q8_0` — 8× more damage for the same budget.
+- **stacking on top of llama.cpp's quantizer** does not help either: on `q8_0`
+  the codec reclaims 0.8% of the bytes (one scale per 128 values instead of one
+  per 32) for 63% more damage, and on `q4_0` an int8 coefficient archive is
+  *larger* than the 4-bit payload it replaces (39.8% vs 28.1%).
 
 The measurements also show K and V are asymmetric: 4-bit **K** is the only
 cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
