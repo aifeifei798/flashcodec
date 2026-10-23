@@ -73,7 +73,12 @@ placeholder package).
   rather than coefficient truncation (weights have no autocorrelated axis and a
   flat trained spectrum; the measured KV analogue is that truncation costs 2.7x
   the bytes of block quantization for the same damage), plus the one-afternoon
-  comparison that would settle it.
+  comparison that would settle it. The appendix also states the two conditions
+  the JPEG analogy needs — energy concentration (`Var(Δ)/Var(X) = 2(1−ρ)`, i.e.
+  ρ ≈ 0.64–0.92 for text K vs ρ ≈ −0.07–0.82 for V) and a non-adaptive baseline
+  quantizer (ggml's per-32 absmax is already an adaptive table) — and why the
+  damage sits along `head_dim` rather than in the frequency domain, making a
+  rotation there (QuaRot/SpinQuant/`hdmd`) the correct form of the same idea.
 
 ## [1.0.0] — 2026-10-23
 

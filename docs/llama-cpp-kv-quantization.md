@@ -444,3 +444,24 @@ at a lower bit width (SVD-LLM, ASVD). If the weights route is ever revisited,
 the cheapest test is one afternoon on a local dense model — at a fixed 25% of
 fp16 bytes, compare (a) per-matrix 2-D DCT truncation, (b) Hadamard +
 per-block 4-bit, (c) SVD rank-r, on perplexity.
+
+### Two conditions the JPEG analogy needs
+
+Transform coding only pays off when (a) the transform concentrates energy and
+(b) an *autocorrelated axis that carries the damage* exists at all. Both are
+measurable, and text KV fails them differently from image patches:
+
+- **Energy concentration**: for a first-order process `Var(Δ)/Var(X) = 2(1−ρ)`.
+  The measured text-KV statistics map to ρ ≈ 0.64–0.92 for K (smooth — the
+  transform does work, and it is the side that benefits in every run above) and
+  ρ ≈ −0.07–0.82 for V (often anti-correlated — the transform cannot help).
+- **A naive baseline quantizer**: JPEG beats *uniform* quantization because its
+  table adds frequency adaptation. ggml's per-32 absmax is already an adaptive
+  table, so most of that gain is spent before the transform arrives — this is
+  exactly the 0.6B / 1.8B / 8B spread in §8.
+- **The damage is not in the frequency domain**: K is the sensitive side because
+  of outlier channels along `head_dim`, not because of its spectrum. So the
+  effective "signal processing before quantization" for K is a **rotation along
+  `head_dim`** (QuaRot, SpinQuant; shipped in llama.cpp as `hdmd`) — the same
+  architecture of idea as this project, applied to the axis where the error
+  actually lives.
