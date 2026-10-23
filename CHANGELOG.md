@@ -8,6 +8,19 @@ The import name is always `flashcodec`; the PyPI distribution is
 `flashcodec-kv` (the bare `flashcodec` name on PyPI is an unrelated 0.0.0
 placeholder package).
 
+## [Unreleased]
+
+### Documentation
+
+- `docs/llama-cpp-kv-quantization.md`: measured same-bytes comparison against
+  llama.cpp's KV quantization on Qwen3-0.6B (llama.cpp `184f65360`). Verdict:
+  `-ctk q8_0` is ~free at 53% of fp16 bytes, while both usable flashcodec tiers
+  lose at equal bytes (truncation needs 2.7× the bytes for the same damage;
+  lossless basis + int8 is 8× worse at 50%). Also records the K/V asymmetry
+  behind the recommended `K=q8_0 + V=q4_0` (40.6% of fp16, +0.28% ppl) and why
+  4-bit K is the only cliff. README gains a matching section and Boundaries
+  bullet; no code or API change.
+
 ## [1.0.0] — 2026-10-23
 
 First stable release. The public surface is frozen for the 1.x line (breaking

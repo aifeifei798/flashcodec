@@ -427,6 +427,35 @@ PNG does not shrink dense storage (the fate of a lossless tier) — its value is
 the 30× variance collapse plus near-zero sparse residuals after Top-M, i.e.
 ideal input for an entropy coder (none is bundled).
 
+## Same-bytes comparison with llama.cpp KV quantization
+
+llama.cpp ships row-wise KV quantization (`-ctk/-ctv`), so the fair question is
+not "does the codec compress" but "does it beat what llama.cpp already has at
+the same byte budget". Measured on the same model (Qwen3-0.6B, wikitext,
+llama.cpp `184f65360`, CUDA + FA):
+
+| KV config | ppl | Δ vs fp16 | of fp16 bytes |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 19.6037 | — | 100% |
+| `-ctk q8_0 -ctv q8_0` | 19.6138 | +0.05% | 53.1% |
+| `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
+| `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
+
+Against that bar, flashcodec does **not** win at equal bytes:
+
+- **truncation (`k < r`)**: `jpeg k=4` on K (75% of fp16 K bytes) damages as
+  much as `q4_0` on everything (28% of fp16 KV bytes) — 2.7× more bytes for the
+  same damage; `k=2` is unusable on dense models.
+- **lossless basis + `quant_bits=8`** (≈50% of fp16 bytes): +0.38% ppl at
+  b32/k32, versus +0.05% for `q8_0` — 8× more damage for the same budget.
+
+The measurements also show K and V are asymmetric: 4-bit **K** is the only
+cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
+the cheap production setting is `-ctk q8_0 -ctv q4_0`, and any future codec work
+has to target **K at 25% bytes** with a rotation/per-channel quantizer, not
+coefficient truncation. Full tables, mechanism and reproduction:
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+
 ## Repository layout
 
 ```
@@ -440,6 +469,7 @@ flashcodec/
 │   └── patch.py           # one-line hot patch: cache-level injection (HF Cache duck-typing)
 ├── tests/                 # jpeg / png / causal / attention suites (standalone scripts)
 ├── benchmarks/            # storage + PSNR/cosine + perplexity benchmarks
+├── docs/                  # measured comparisons (vs llama.cpp KV quantization)
 ├── demo/                  # Gradio side-by-side chat
 ├── images/                # README screenshots
 ├── .github/workflows/     # CI: CPU tests + transformers integration
@@ -493,6 +523,11 @@ a stable interface, not a claim of production readiness.
   perplexity 16.8 → 6486 at k=2). Use `k = r` + `quant_bits=8` there (~52%
   storage, +2% ppl) and reserve aggressive ratios for hybrid models where only
   the full-attention layers carry a codec.
+- **Not a better KV quantizer than llama.cpp's.** At equal bytes, `q8_0` beats
+  both usable tiers (truncation, and lossless-basis + int8: +0.05% vs +0.38%
+  ppl); 4-bit V is nearly free while 4-bit K is the only cliff. The codec is a
+  sequence-axis storage experiment, not a drop-in replacement for `-ctk/-ctv` —
+  see [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 - Same lineage as the v4.2 prototypes inside
   [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
   (there: per-position view semantics for cross-layer KV reuse; here:

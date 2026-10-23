@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 dist/
 *.egg-info/
+# local llama.cpp checkout used for the KV-quantization experiments (docs/)
+/llama.cpp/

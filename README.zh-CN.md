@@ -388,6 +388,32 @@ step 重解全部历史（此前最后两行为 38.7ms / 71.9ms）。
 PNG 模式不省稠密存储（无损基线的宿命）——它的价值在 30× 方差压缩 + Top-M
 近零稀疏残差，是熵编码器的理想输入（本库不内置熵编码）。
 
+## 与 llama.cpp KV 量化的同字节对比
+
+llama.cpp 自带行级 KV 量化（`-ctk/-ctv`），所以公平的问题不是「codec 能不能压」，
+而是「同样的字节预算下能不能赢过它」。同模型实测（Qwen3-0.6B、wikitext、
+llama.cpp `184f65360`、CUDA + FA）：
+
+| KV 配置 | ppl | Δ vs fp16 | 占 fp16 字节 |
+|---|---|---|---|
+| `-ctk f16 -ctv f16` | 19.6037 | — | 100% |
+| `-ctk q8_0 -ctv q8_0` | 19.6138 | +0.05% | 53.1% |
+| `-ctk q8_0 -ctv q4_0` | 19.6579 | +0.28% | 40.6% |
+| `-ctk q4_0 -ctv q4_0` | 65.8321 | +236% | 28.1% |
+
+对着这条线，flashcodec 在同字节下**没有优势**：
+
+- **截断（`k < r`）**：K 上 `jpeg k=4`（75% 的 fp16 K 字节）与全量 `q4_0`
+  （28% 的 fp16 KV 字节）损伤相同 —— 同等损伤多用 2.7× 字节；密集模型上 `k=2` 不可用。
+- **无损基 + `quant_bits=8`**（约 50% fp16 字节）：b32/k32 配置 +0.38% ppl，
+  而 `q8_0` 是 +0.05% —— 同预算下损伤差 8×。
+
+实测还显示 K 与 V 不对称：4-bit **K** 是唯一的悬崖（只压 K 到 `q4_0` → +237%），
+4-bit V 几乎免费（+0.29%）。所以生产上便宜的配置是 `-ctk q8_0 -ctv q4_0`；
+未来 codec 若要继续竞争，目标只能是 **K 的 25% 字节**，且要靠沿 head_dim 的
+旋转 / 逐通道量化，而不是系数截断。完整表格、机理与复现：
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
+
 ## 目录结构
 
 ```
@@ -401,6 +427,7 @@ flashcodec/
 │   └── patch.py           # 一行热补丁：Cache 层注入（HF Cache 鸭子类型）
 ├── tests/                 # jpeg / png / causal / attention 四组测试（直接运行）
 ├── benchmarks/            # 显存/存储 + PSNR/余弦 + 困惑度压测
+├── docs/                  # 实测对比（vs llama.cpp KV 量化）
 ├── demo/                  # Gradio 左右对比 chat
 ├── images/                # README 截图
 ├── .github/workflows/     # CI：CPU 测试 + transformers 集成
@@ -448,6 +475,10 @@ python tests/test_attention.py      # 系数域解码 attention 与物化路径�
   Qwen3-0.6B 困惑度 16.8 → 6486 @ k=2）。这种模型请用 `k = r` +
   `quant_bits=8`（约 52% 存储，+2% ppl）；激进压缩比留给混合架构（只有
   full_attention 层挂 codec 的情形）。
+- **不是 llama.cpp KV 量化的更优替代**：同字节下 `q8_0` 赢过两个可用档位
+  （截断；以及无损基 + int8，+0.05% vs +0.38% ppl）；4-bit V 几乎免费，
+  4-bit K 是唯一悬崖。本库是 seq 轴上的存储研究，不是 `-ctk/-ctv` 的替换品，
+  详见 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md)。
 - 与 [Mini-Architecture](https://github.com/aifeifei798/Mini-Architecture)
   中 v4.2 原型（模型内 KV 复用层的 DCT/差分读取）同源：那里是"每位置视图"
   语义，这里是标准 cache 存储语义。
