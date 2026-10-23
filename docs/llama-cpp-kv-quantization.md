@@ -425,3 +425,22 @@ llama.cpp/build/bin/llama-bench -m qwen3-0.6b-f16.gguf \
 The HF-side A/B harness (K-only / V in {raw, quant, codec}, ggml-style row
 quantization emulation, DCT tiers) is a standalone script kept with the
 experiment record; it is not part of the published package.
+
+## Appendix: why this is about KV and not about model weights
+
+The original idea was JPEG-for-weights: keep only the low-frequency
+coefficients and shrink the model by 75%. That needs an autocorrelated axis,
+and weights do not have one — an `(out, in)` matrix has no sequence axis, and
+its trained spectrum is flat (high stable rank), so "keep the low-frequency
+quarter" degenerates into a low-rank truncation that costs far more than 75% of
+the information. The same asymmetry was measured here on KV: truncation needs
+**2.7× the bytes** of block quantization for the same damage (§2).
+
+The workable form of the same intuition is not truncation but **rotate, then
+quantize**: Hadamard / random rotations spread the energy before per-block
+quantization (QuaRot, SpinQuant; llama.cpp ships this as `hdmd`), and hybrid
+low-rank-plus-quantization keeps the dominant subspace while encoding the rest
+at a lower bit width (SVD-LLM, ASVD). If the weights route is ever revisited,
+the cheapest test is one afternoon on a local dense model — at a fixed 25% of
+fp16 bytes, compare (a) per-matrix 2-D DCT truncation, (b) Hadamard +
+per-block 4-bit, (c) SVD rank-r, on perplexity.

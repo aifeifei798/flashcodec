@@ -69,6 +69,11 @@ placeholder package).
   negative result up front (what was tested, the equal-byte table, the operating
   point where the transform is a no-op, and the conclusion that it is not
   implemented in llama.cpp), linking to the full doc.
+- Same doc, appendix: why the original "JPEG for weights" idea needs a rotation
+  rather than coefficient truncation (weights have no autocorrelated axis and a
+  flat trained spectrum; the measured KV analogue is that truncation costs 2.7x
+  the bytes of block quantization for the same damage), plus the one-afternoon
+  comparison that would settle it.
 
 ## [1.0.0] — 2026-10-23
 
