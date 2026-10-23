@@ -465,8 +465,11 @@ confirmed inside llama.cpp, and it does not make 4-bit K usable on this model
 
 The measurements also show K and V are asymmetric: 4-bit **K** is the only
 cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
-the cheap production setting is `-ctk q8_0 -ctv q4_0`. Full tables, mechanism
-and reproduction:
+the cheap production setting is `-ctk q8_0 -ctv q4_0`. But that cliff is a
+**small-model** property: on a 27B hybrid (`qwen35`, 17 KV-bearing layers)
+`q4_0` KV costs +0.39% at 8k context and +0.20% at 32k, so production-scale
+models have no byte-budget problem for this codec to solve. Full tables,
+mechanism and reproduction:
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 
 ## Repository layout

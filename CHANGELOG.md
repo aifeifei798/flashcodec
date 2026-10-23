@@ -34,6 +34,13 @@ placeholder package).
   transform shapes the error into the slowly-varying subspace that softmax
   barely sees. HF-measured, not yet confirmed in llama.cpp; 4-bit K remains
   unusable on this model.
+- Same doc, §6: the 4-bit cliff is a *small-model* property. On a local 27B
+  hybrid (DrakIdol Qwen3.8-27B-Plus Q4_K, `qwen35`, 17 KV-bearing layers),
+  `q4_0` KV costs +0.19% at 512 ctx, +0.39% at 8k and +0.20% at 32k (CIs
+  ±0.06–0.10), where the 0.6B costs +236%. So the §5 win lives where the model
+  is already broken: a mechanism result, not a deployment feature. Gemma4-12B is
+  dense but has a 302 perplexity on wikitext (roleplay finetune), so its deltas
+  are not usable without an in-domain corpus.
 
 ## [1.0.0] — 2026-10-23
 

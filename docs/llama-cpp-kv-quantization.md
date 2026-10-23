@@ -26,6 +26,12 @@ the slowly-varying subspace, which softmax barely sees), not a better K. That
 result is HF-measured and still needs confirming inside llama.cpp; it does not
 make 4-bit K usable on this model (ppl 41.6 vs 18.6).
 
+**Scale check.** On a 27B hybrid (`qwen35`, 17 KV-bearing layers) the same
+`q4_0` KV config costs +0.39% at 8k context and +0.20% at 32k — the small-model
+cliff (+236% on 0.6B) does not exist at production scale (§6). The transform's win
+therefore lives where the model is already broken: a mechanism result, not a
+deployment feature.
+
 Finally, K and V are not equally sensitive, which changes how a KV budget should
 be spent.
 
@@ -211,7 +217,36 @@ also why larger blocks (finer frequency resolution) keep improving the result.
   baseline). A llama.cpp implementation is needed before quoting it as a win
   there; a larger model is needed before claiming it makes 4-bit K usable.
 
-## 6. What this means for flashcodec
+## 6. Model size: the cliff is a small-model property
+
+The same KV-type sweep on a production-scale local checkpoint — DrakIdol
+Qwen3.8-27B-Plus, GGUF `Q4_K`, arch `qwen35`, 64 layers with
+`full_attention_interval = 4` (17 KV-bearing layers), 4 KV heads × 256 dim,
+i.e. 68 KiB of KV per token:
+
+| context | f16 | `q8_0` K+V | `q4_0` K+V |
+|---|---|---|---|
+| 512 (20 chunks) | 6.8003 | 6.8038 (+0.05%) | 6.8130 (+0.19%) |
+| 8192 (4 chunks) | 5.4791 | — | 5.5005 (+0.39%) |
+| 32768 (4 chunks) | 6.1354 | 6.1384 (+0.05%) | 6.1475 (+0.20%) |
+
+At 8k the split is K-only +0.24%, V-only +0.13%, and `q8_0` K + `q4_0` V is
++0.06% — all inside the ±0.10 CI. So the 4-bit regime that collapses the 0.6B
+(+236%) is **essentially free at 27B**, and stays free out to 32k context.
+
+Consequence: the cliff is a property of small models, not of KV quantization.
+The DCT win of §5 sits exactly where the model is already broken, and the models
+that actually have a byte-budget problem (large, long context) do not need it.
+That leaves §5 as a mechanism result — the error shaping is real and reproducible
+— rather than a deployment feature.
+
+(Locally there is also Gemma4-12B, dense with 48 layers, but on wikitext its
+perplexity is ~302 because it is a roleplay finetune; its deltas are dominated by
+the ±23 confidence interval — e.g. `q4_0` K+V +13%, single-side +4%/0%. A
+decisive dense mid-size test needs an in-domain corpus and a distribution metric
+(KL or token agreement) rather than perplexity.)
+
+## 7. What this means for flashcodec
 
 - The library's value is **storage-side research on the sequence axis**, not a
   production KV-cache replacement for llama.cpp. The honest framing is the one
@@ -225,7 +260,7 @@ also why larger blocks (finer frequency resolution) keep improving the result.
   simply: `-ctk q8_0 -ctv q4_0` (40.6% of fp16 KV, +0.28% ppl), never
   `-ctk q4_0`.
 
-## 7. Limitations
+## 8. Limitations
 
 - One model (Qwen3-0.6B), one context length (512). Longer contexts usually make
   KV quantization *more* damaging, but they should not reorder DCT vs row
@@ -239,7 +274,7 @@ also why larger blocks (finer frequency resolution) keep improving the result.
   for large models at very long context — where `q8_0` K + `q4_0` V is still the
   cheaper answer.
 
-## 8. Reproduce
+## 9. Reproduce
 
 ```bash
 # convert (needs the `gguf` + `sentencepiece` python packages)
