@@ -41,6 +41,14 @@ placeholder package).
   is already broken: a mechanism result, not a deployment feature. Gemma4-12B is
   dense but has a 302 perplexity on wikitext (roleplay finetune), so its deltas
   are not usable without an in-domain corpus.
+- Same doc, §7: Gemma4-12B (`gemma4`, 48 layers = 40 SWA@1024 + 8 global MQA)
+  measured with `--kl-divergence` because its perplexity is not a valid metric
+  (baselines 302 / 355 / 2.24 / 18.87 across corpora; quantization sometimes
+  *lowers* ppl). Mean KL: 0.168 at `q8_0`, 0.230 (`q4_0` K), 0.225 (`q4_0` V),
+  0.303 at `q4_0` K+V, top-1 agreement 89.1%. No cliff at 12B, but 4-bit is not
+  free either. K and V contribute equally in KL even though ppl blames V 2×.
+  Same protocol on the 27B hybrid: KL 0.0021 (`q8_0`) / 0.0035 (`q4_0`) — 86×
+  less distortion, because only 17 of its 64 layers read a KV cache.
 
 ## [1.0.0] — 2026-10-23
 

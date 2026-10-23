@@ -468,8 +468,15 @@ cliff (K alone at `q4_0` → +237%), while 4-bit V is nearly free (+0.29%). So
 the cheap production setting is `-ctk q8_0 -ctv q4_0`. But that cliff is a
 **small-model** property: on a 27B hybrid (`qwen35`, 17 KV-bearing layers)
 `q4_0` KV costs +0.39% at 8k context and +0.20% at 32k, so production-scale
-models have no byte-budget problem for this codec to solve. Full tables,
-mechanism and reproduction:
+models have no byte-budget problem for this codec to solve.
+
+**Dense mid-size models are the one place where 4-bit KV is costly without
+collapsing**, and also the one place where perplexity stops working as a metric.
+Gemma4-12B (48 layers, 40 SWA + 8 global MQA) measured with
+`--kl-divergence`: KL 0.17 at 8 bits, 0.30 at 4 bits, top-1 agreement 89%
+(versus 0.0035 on the 27B hybrid). Its ppl ranges from 2.2 to 355 depending on
+the corpus and sometimes *improves* under quantization, so ppl cannot be used
+there. Full tables, mechanism and reproduction:
 [`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
 
 ## Repository layout
