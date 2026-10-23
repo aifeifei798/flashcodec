@@ -61,6 +61,36 @@ in an append-only reconstruction buffer) instead of re-decoding the whole
 history on every decode step. (Fragmented per-block archive lists made
 per-token decode ~170× slower at S=4096 due to kernel-launch overhead.)
 
+## Research note (2026-10): tested against llama.cpp KV quantization — negative result
+
+We tried to take this from a storage prototype to a llama.cpp KV-cache
+replacement: DCT along the sequence axis, instead of or on top of llama.cpp's
+row-wise KV quantization (`-ctk/-ctv`). Four models (Qwen3-0.6B, Hy-MT2-1.8B,
+Gemma4-E2B, plain dense Qwen3-8B), equal bytes, scored with **mean KL +
+top-1 agreement** (perplexity turned out to be a calibration artifact on
+finetuned models, and it disagrees with KL about which of K/V matters):
+
+| variant | 8-bit budget | 4-bit budget |
+|---|---|---|
+| truncation (`k < r`) | — | 2.7× more bytes for the same damage as `q4_0`; `k=2` unusable |
+| lossless basis + per-frequency int8 | 8× more damage than `q8_0` | 13% bytes, unusable |
+| DCT coefficients, ggml per-32 scales | 3× lower KL on 0.6B, neutral on 1.8B/E2B/8B | 2.3× lower KL on 0.6B (still broken), 6–170% **worse** elsewhere |
+| codec stacked on `q8_0` | 0.8% fewer bytes for 63% more damage | — |
+
+At the operating point that actually matters — `q8_0` K + `q4_0` V, 40.6% of
+fp16 KV — the transform is a **no-op** on Qwen3-8B (KL 0.0047 raw vs 0.0045 with
+DCT on K, top-1 97.3% vs 97.2%), while spending the 4 bits on V instead of K is
+worth ~10×.
+
+**Conclusion: not implemented in llama.cpp, and not recommended.** The seq-axis
+transform only wins where row quantization has already destroyed the model;
+wherever quantization is acceptable it is neutral or worse. What survives is the
+mechanism study — the transform redistributes quantization error into a
+slowly-varying subspace (same L2 error, 3–6× less perplexity damage), and KV
+damage depends on architectural exposure and on K/V asymmetry as much as on
+size. Full tables, mechanism and reproduction:
+[`docs/llama-cpp-kv-quantization.md`](docs/llama-cpp-kv-quantization.md).
+
 ## Causal-safety design
 
 Only **complete blocks** are archived; the current incomplete block always

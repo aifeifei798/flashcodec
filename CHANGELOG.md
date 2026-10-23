@@ -65,6 +65,10 @@ placeholder package).
   with DCT on K (top-1 97.3% vs 97.2%), i.e. the transform is a no-op while
   spending the 4 bits on V instead of K is worth 10x. K is again ~18x more
   sensitive than V, so the K/V asymmetry is architectural, not a size effect.
+- README.md / README.zh-CN.md: new top-level "research note" section stating the
+  negative result up front (what was tested, the equal-byte table, the operating
+  point where the transform is a no-op, and the conclusion that it is not
+  implemented in llama.cpp), linking to the full doc.
 
 ## [1.0.0] — 2026-10-23
 
